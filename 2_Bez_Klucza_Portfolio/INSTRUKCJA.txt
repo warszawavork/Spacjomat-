@@ -1,0 +1,40 @@
+========================================================================
+                 SPACJOMAT v6.0 (AI + Grammarly + 4.5M SJP)
+     Hybrydowa Autokorekta i Logika Zdań (Brak Ikon na Pasku Zadań)
+========================================================================
+
+------------------------------------------------------------------------
+1. JAK DZIAŁA NOWY SILNIK HYBRYDOWY:
+------------------------------------------------------------------------
+  [A] PISANIE NA ŻYWO NA SPACJI (100% OFFLINE, < 5 ms):
+      • Pełna baza 4 497 104 polskich form ze Słownika Języka Polskiego (SJP),
+        221 444 słów z połączonej bazy Google GBoard + polskiego języka mówionego,
+        29 209 zweryfikowanych reguł (w tym LanguageTool) i reguły bigramowe.
+      • Nigdy nie psuje poprawnych słów ("okej", "nadal", "sama", "sprawie").
+      • Klawisz Backspace natychmiast cofa ostatnią zmianę i uczy się wyjątku.
+
+  [B] INTELIGENTNA LOGIKA CAŁEJ WIADOMOŚCI (STYL GRAMMARLY + AI):
+      • Klawisz F7 (lub kliknięcie pływającej pigułki "✨ Popraw" w rogu ekranu):
+        Automatycznie zaznacza całą wiadomość w aktywnym polu czatu/dokumentu,
+        rozumie jej pełny sens i logikę, naprawia literówki, gramatykę i przecinki!
+      • Klawisz F8 lub Ctrl+Shift+K:
+        Poprawia wyłącznie tekst zaznaczony myszką.
+      • Klawisz F9: Wstrzymuje / wznawia autokorektę na Spacji.
+
+------------------------------------------------------------------------
+2. KONFIGURACJA AI (GEMINI / OPENAI / OLLAMA):
+------------------------------------------------------------------------
+Aby włączyć pełne rozumienie sensu i logiki (jak w Grammarly):
+  1. Kliknij ikonę ⚙ na pigułce w rogu ekranu (lub prawym przyciskiem myszy
+     na ikonkę koło zegarka -> "Ustawienia AI").
+  2. Wklej darmowy klucz API Google Gemini (z aistudio.google.com/apikey)
+     albo adres własnego serwera (OpenAI / Groq / lokalna Ollama).
+  3. Kliknij "Testuj połączenie AI" i "Zapisz".
+  (Gdy nie ma internetu lub klucza, Spacjomat płynnie używa bazy Offline!)
+
+------------------------------------------------------------------------
+3. URUCHAMIANIE I AUTOSTART:
+------------------------------------------------------------------------
+  • Ikona "Spacjomat" na Pulpicie lub w folderze Desktop\Spacjomat.
+  • Program jest w Autostarcie Windows i NIE pojawia się na dolnym pasku zadań.
+========================================================================
