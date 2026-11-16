@@ -1,0 +1,15 @@
+# Secrets & local user data (NEVER commit!)
+ai_config.json
+ai_usage.json
+log.txt
+log.old.txt
+dev.flag
+.write_test.tmp
+*.lnk
+
+# Local-only big dictionary variant (the repo uses the compact sjp_hashes.d48)
+sjp_hashes.bin
+
+# Distribution bundles
+Do_Wyslania/
+*.zip

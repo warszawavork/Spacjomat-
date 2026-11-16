@@ -1,40 +1,76 @@
 ========================================================================
-                 SPACJOMAT v6.0 (AI + Grammarly + 4.5M SJP)
-     Hybrydowa Autokorekta i Logika Zdań (Brak Ikon na Pasku Zadań)
+        SPACJOMAT  -  Hybrydowy Korektor Języka Polskiego
+        (Baza 4.5M słów offline + AI)  -  INSTRUKCJA
 ========================================================================
 
 ------------------------------------------------------------------------
-1. JAK DZIAŁA NOWY SILNIK HYBRYDOWY:
+1. START (dla każdego, 30 sekund)
 ------------------------------------------------------------------------
-  [A] PISANIE NA ŻYWO NA SPACJI (100% OFFLINE, < 5 ms):
-      • Pełna baza 4 497 104 polskich form ze Słownika Języka Polskiego (SJP),
-        221 444 słów z połączonej bazy Google GBoard + polskiego języka mówionego,
-        29 209 zweryfikowanych reguł (w tym LanguageTool) i reguły bigramowe.
-      • Nigdy nie psuje poprawnych słów ("okej", "nadal", "sama", "sprawie").
-      • Klawisz Backspace natychmiast cofa ostatnią zmianę i uczy się wyjątku.
-
-  [B] INTELIGENTNA LOGIKA CAŁEJ WIADOMOŚCI (STYL GRAMMARLY + AI):
-      • Klawisz F7 (lub kliknięcie pływającej pigułki "✨ Popraw" w rogu ekranu):
-        Automatycznie zaznacza całą wiadomość w aktywnym polu czatu/dokumentu,
-        rozumie jej pełny sens i logikę, naprawia literówki, gramatykę i przecinki!
-      • Klawisz F8 lub Ctrl+Shift+K:
-        Poprawia wyłącznie tekst zaznaczony myszką.
-      • Klawisz F9: Wstrzymuje / wznawia autokorektę na Spacji.
+  1. Rozpakuj CAŁY folder ZIP w dowolne miejsce (np. Pulpit\Spacjomat).
+     (Nie uruchamiaj z podglądu ZIP - najpierw "Wypakuj wszystko".)
+  2. Kliknij dwukrotnie  Zainstaluj_Skrot_Na_Pulpicie.bat
+     (zdejmuje blokadę Windows i tworzy ikonę "Spacjomat" na Pulpicie)
+     albo po prostu  Uruchom_Spacjomat.bat
+  3. Jeśli Windows pokaże niebieskie okno "System Windows chronił ten komputer":
+     kliknij "Więcej informacji" -> "Uruchom mimo to".
+  4. Przy zegarku pojawi się ikona Spacjomatu, a na ekranie mała pigułka.
 
 ------------------------------------------------------------------------
-2. KONFIGURACJA AI (GEMINI / OPENAI / OLLAMA):
+2. SKRÓTY KLAWISZOWE
 ------------------------------------------------------------------------
-Aby włączyć pełne rozumienie sensu i logiki (jak w Grammarly):
-  1. Kliknij ikonę ⚙ na pigułce w rogu ekranu (lub prawym przyciskiem myszy
-     na ikonkę koło zegarka -> "Ustawienia AI").
-  2. Wklej darmowy klucz API Google Gemini (z aistudio.google.com/apikey)
-     albo adres własnego serwera (OpenAI / Groq / lokalna Ollama).
-  3. Kliknij "Testuj połączenie AI" i "Zapisz".
-  (Gdy nie ma internetu lub klucza, Spacjomat płynnie używa bazy Offline!)
+  F8   lub  Ctrl+Shift+K   = szybka korekta bazą OFFLINE (~2-30 ms, bez internetu)
+  F7   lub  Ctrl+Shift+L   = korekta AI całego tekstu (wymaga darmowego klucza)
+  F9                       = pauza / wznowienie autokorekty na spacji
+  Backspace tuż po autokorekcie = cofnięcie poprawki
+
+  Te same akcje są pod przyciskami na pigułce i w menu ikony przy zegarku.
+
+  WAŻNE (laptopy): jeśli F7/F8 nic nie robią, klawisze funkcyjne mogą być
+  przełączone na multimedia (jasność, głośność). Użyj Fn+F7 / Fn+F8,
+  włącz "Fn Lock" (Fn+Esc) albo używaj skrótów Ctrl+Shift+K / Ctrl+Shift+L,
+  które działają zawsze, na każdej klawiaturze.
 
 ------------------------------------------------------------------------
-3. URUCHAMIANIE I AUTOSTART:
+3. AI POD F7 (opcjonalnie)
 ------------------------------------------------------------------------
-  • Ikona "Spacjomat" na Pulpicie lub w folderze Desktop\Spacjomat.
-  • Program jest w Autostarcie Windows i NIE pojawia się na dolnym pasku zadań.
+  1. Kliknij ⚙ na pigułce (albo prawy przycisk na ikonie przy zegarku).
+  2. Wklej darmowy klucz z https://aistudio.google.com/apikey
+     (albo wybierz preset Groq z https://console.groq.com/keys).
+  3. Kliknij "Testuj połączenie AI" - udany test sam zapisuje klucz.
+  Bez klucza działa wszystko poza F7 (offline F8 działa zawsze).
+
+------------------------------------------------------------------------
+4. COŚ NIE DZIAŁA? (kolejność od najprostszego)
+------------------------------------------------------------------------
+  A. Ikona przy zegarku -> "Diagnostyka (gdy F7/F8 nie działa)".
+     Pokaże: czy hak klawiatury działa, które skróty są zajęte, jaki
+     klawisz Spacjomat widział jako ostatni, czy to Fn Lock i czy folder
+     ma prawa zapisu.
+  B. Kliknij dwukrotnie  Napraw_Spacjomat.bat
+     (zamyka stare kopie, odblokowuje pliki, kasuje log, uruchamia od nowa).
+  C. Aplikacja, w której piszesz, działa "jako Administrator"?
+     Wtedy Windows nie pozwala zwykłym programom wysyłać jej klawiszy.
+     Uruchom Spacjomat także jako Administrator (prawy przycisk ->
+     "Uruchom jako administrator" na Uruchom_Spacjomat.bat).
+  D. Inny program zajął F7/F8 (np. Word, narzędzia producenta laptopa)?
+     Diagnostyka pokaże "ZAJETY" - użyj wtedy Ctrl+Shift+K / Ctrl+Shift+L.
+  E. Windows blokuje pliki z internetu: prawy przycisk na ZIP ->
+     Właściwości -> zaznacz "Odblokuj" -> OK, i wypakuj ponownie.
+  F. Wciąż nie działa? Wyślij plik  log.txt  z folderu Spacjomatu.
+
+  Spacjomat sam się pilnuje: co ~45 s odświeża hak klawiatury, po wybudzeniu
+  z uśpienia / odblokowaniu komputera / podłączeniu lub odłączeniu monitora
+  zakłada go ponownie, a pływające okna zawsze wracają na widoczny ekran.
+
+------------------------------------------------------------------------
+5. PLIKI W FOLDERZE
+------------------------------------------------------------------------
+  Uruchom_Spacjomat.bat ............ start programu
+  Zainstaluj_Skrot_Na_Pulpicie.bat . ikona na Pulpicie + odblokowanie
+  Napraw_Spacjomat.bat ............. restart i naprawa jednym kliknięciem
+  Spacjomat.cs / .ps1 / .vbs ....... kod i launcher (kompilacja w pamięci)
+  slowa_pl.txt, reguly.txt, ... .... bazy słów i reguł
+  wlasne_slowa.txt ................. Twoje własne słowa (dopisz, nie psuj)
+  ai_config.json ................... Twoje ustawienia i klucz (NIE wysyłaj dalej!)
+  log.txt .......................... dziennik pracy (sam się czyści)
 ========================================================================
