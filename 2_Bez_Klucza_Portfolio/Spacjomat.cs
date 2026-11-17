@@ -1668,7 +1668,7 @@ public class SpacjomatContext : ApplicationContext
     {
         try
         {
-            if (f == null || f.IsDisposed) return;
+            if (f == null || f.IsDisposed || !f.Visible) return;
             Rectangle b = f.Bounds;
             bool visible = false;
             foreach (Screen sc in Screen.AllScreens)
@@ -1679,8 +1679,18 @@ public class SpacjomatContext : ApplicationContext
             if (!visible)
             {
                 Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-                f.Location = new Point(wa.Right - f.Width - 20, wa.Bottom - f.Height - 20);
-                Log("Stability: okno poza ekranem - przywrocono pozycje.");
+                Point np = new Point(wa.Right - f.Width - 20, wa.Bottom - f.Height - 20);
+                if (f.Location != np)
+                {
+                    f.Location = np;
+                    if (f == grammarlyPill && aiConfig != null)
+                    {
+                        aiConfig.PillX = np.X;
+                        aiConfig.PillY = np.Y;
+                        aiConfig.Save();
+                    }
+                    Log("Stability: okno poza ekranem - przywrocono pozycje.");
+                }
             }
         }
         catch { }
@@ -2542,7 +2552,7 @@ public class SpacjomatContext : ApplicationContext
         if (reselectAll)
         {
             SimulateSelectAll();
-            Thread.Sleep(30);
+            Thread.Sleep(45);
         }
 
         bool clipSet = false;
@@ -2563,7 +2573,7 @@ public class SpacjomatContext : ApplicationContext
             return;
         }
 
-        Thread.Sleep(25);
+        Thread.Sleep(40);
         SimulatePaste();
 
         if (floatingBanner != null && !string.IsNullOrEmpty(bannerMsg))
@@ -2573,7 +2583,7 @@ public class SpacjomatContext : ApplicationContext
 
         if (hadBackup && backupText != null)
         {
-            Thread.Sleep(220);
+            Thread.Sleep(420);
             RestoreClipboardSafe(true, backupText);
         }
     }
