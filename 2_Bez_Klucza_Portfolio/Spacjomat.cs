@@ -16,10 +16,11 @@ public class AiConfig
     public bool EnableAi = true;
     public string Provider = "gemini"; // "gemini" or "openai"
     public string ApiKey = "";
-    public string Model = "gemini-3.5-flash-lite";
+    public string Model = "gemini-3.1-flash-lite";
     public string CustomEndpoint = "";
     public string Style = "natural"; // "natural", "business", "strict"
     public string CorrectionMode = "suggest"; // "suggest" or "auto"
+    public bool FastHedgeMode = true; // Szybka asekuracja F7 (rownolegly zapasowy model przy zwisie >1.9s)
     public int DailyLimitEstimate = 250;
     public int RpmLimitEstimate = 15;
     public bool ShowPill = true;
@@ -38,7 +39,7 @@ public class AiConfig
     public void Clamp()
     {
         if (string.IsNullOrEmpty(Provider)) Provider = "gemini";
-        if (string.IsNullOrEmpty(Model)) Model = "gemini-3.5-flash-lite";
+        if (string.IsNullOrEmpty(Model)) Model = "gemini-3.1-flash-lite";
         if (string.IsNullOrEmpty(Style)) Style = "natural";
         if (CorrectionMode != "auto") CorrectionMode = "suggest";
         if (DailyLimitEstimate < 20) DailyLimitEstimate = 20;
@@ -71,6 +72,7 @@ public class AiConfig
         CustomEndpoint = src.CustomEndpoint;
         Style = src.Style;
         CorrectionMode = src.CorrectionMode;
+        FastHedgeMode = src.FastHedgeMode;
         DailyLimitEstimate = src.DailyLimitEstimate;
         RpmLimitEstimate = src.RpmLimitEstimate;
         Clamp();
@@ -369,6 +371,24 @@ public class AiSuggestionResult
 
 public static class AiCorrectionEngine
 {
+    private class CacheEntry
+    {
+        public string Value;
+        public DateTime ExpiresUtc;
+    }
+
+    private static readonly object cacheLock = new object();
+    private static readonly Dictionary<string, CacheEntry> aiCache = new Dictionary<string, CacheEntry>(StringComparer.Ordinal);
+    private static readonly LinkedList<string> aiCacheOrder = new LinkedList<string>();
+
+    // Zapamietuje dla kazdego modelu dzialajacy tryb thinkingConfig ("budget0", "minimal", "none")
+    private static readonly Dictionary<string, string> thinkingModeCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly object metaLock = new object();
+    private static List<string> cachedGeminiModels = null;
+    private static string cachedGeminiKey = "";
+    private static DateTime cachedGeminiModelsExpiry = DateTime.MinValue;
+    private static int lastWarmUpTick = 0;
+
     static AiCorrectionEngine()
     {
         try
@@ -376,7 +396,9 @@ public static class AiCorrectionEngine
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
             ServicePointManager.Expect100Continue = false;
             ServicePointManager.UseNagleAlgorithm = false;
-            ServicePointManager.DefaultConnectionLimit = 16;
+            ServicePointManager.DefaultConnectionLimit = 24;
+            ServicePointManager.MaxServicePointIdleTime = 180000;
+            ServicePointManager.DnsRefreshTimeout = 300000;
         }
         catch { }
     }
@@ -384,6 +406,7 @@ public static class AiCorrectionEngine
     public static void WarmUpConnectionAsync(AiConfig cfg)
     {
         if (cfg == null || !IsAiReady(cfg)) return;
+        lastWarmUpTick = Environment.TickCount;
         ThreadPool.QueueUserWorkItem(state =>
         {
             try
@@ -394,11 +417,31 @@ public static class AiCorrectionEngine
                     var headers = new Dictionary<string, string>();
                     headers["x-goog-api-key"] = cleanKey;
                     WebHeaderCollection hdrs;
-                    HttpRequestWithMeta("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", null, headers, out hdrs);
+                    HttpWebRequest reqOut;
+                    HttpRequestWithMeta("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", null, headers, 4500, out hdrs, out reqOut);
+                }
+                else if (cfg.Provider == "openai")
+                {
+                    string ep = string.IsNullOrEmpty(cfg.CustomEndpoint) ? "https://api.openai.com/v1/chat/completions" : cfg.CustomEndpoint.Trim();
+                    int idx = ep.IndexOf("/chat/completions", StringComparison.OrdinalIgnoreCase);
+                    string modelsUrl = (idx > 0) ? (ep.Substring(0, idx) + "/models") : ep;
+                    var headers = new Dictionary<string, string>();
+                    if (!string.IsNullOrEmpty(cleanKey)) headers["Authorization"] = "Bearer " + cleanKey;
+                    WebHeaderCollection hdrs;
+                    HttpWebRequest reqOut;
+                    HttpRequestWithMeta("GET", modelsUrl, null, headers, 4500, out hdrs, out reqOut);
                 }
             }
             catch { }
         });
+    }
+
+    public static void MaybeKeepAliveAsync(AiConfig cfg)
+    {
+        if (cfg == null || !IsAiReady(cfg)) return;
+        int now = Environment.TickCount;
+        if (unchecked(now - lastWarmUpTick) < 55000) return;
+        WarmUpConnectionAsync(cfg);
     }
 
     public static bool IsAiReady(AiConfig cfg)
@@ -410,43 +453,69 @@ public static class AiCorrectionEngine
         return false;
     }
 
-    private static string BuildSystemPrompt(string style, bool jsonSuggestMode)
+    private static string BuildSystemPrompt(string style, bool jsonSuggestMode, int inputLen)
     {
-        string styleNote = "Zachowaj naturalny, potoczny styl i ton autora.";
+        string styleNote = "Zachowaj naturalny styl.";
         if (style == "business")
         {
-            styleNote = "Nadaj uprzejmy, klarowny ton biznesowy.";
+            styleNote = "Nadaj uprzejmy ton biznesowy.";
         }
         else if (style == "strict")
         {
-            styleNote = "Popraw tylko literówki, błędne słowa i interpunkcję – zmieniaj minimalnie.";
+            styleNote = "Zmieniaj minimalnie — tylko błędy.";
         }
 
         if (!jsonSuggestMode)
         {
-            return "Szybki korektor j. polskiego (Grammarly). " + styleNote +
-                   " Popraw wszystkie literówki, polskie znaki, mylne słowa (np. tyldo->tylko, coiemiue->ciebie, testu->tekstu) i przecinki w CAŁYM tekście bez skracania. Zachowaj URL i liczby. Zwróć WYŁĄCZNIE poprawiony tekst.";
+            return "Szybki korektor PL. " + styleNote +
+                   " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. Zachowaj URL i liczby. Zwróć WYŁĄCZNIE poprawiony tekst.";
         }
 
-        return "Szybki korektor j. polskiego (Grammarly). " + styleNote +
-               " Popraw wszystkie literówki, polskie znaki, mylne słowa (np. tyldo->tylko, coiemiue->ciebie, testu->tekstu) i przecinki od początku do końca bez skracania. " +
-               "Zwróć WYŁĄCZNIE czysty JSON: {\"hasErrors\":true,\"f\":[\"błąd->poprawka\"],\"o\":[{\"l\":\"✨ Poprawnie\",\"t\":\"pełny poprawiony tekst\"},{\"l\":\"💬 Inaczej / krócej\",\"t\":\"opcjonalny 2. wariant\"}]}. " +
-               "W f wpisz max 4 faktycznie zmienione wyrazy (nie identyczne). W o podaj max 2 opcje. Jeśli tekst jest poprawny: {\"hasErrors\":false,\"f\":[],\"o\":[]}.";
+        if (style == "strict" || inputLen > 350)
+        {
+            return "Szybki korektor PL. " + styleNote +
+                   " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
+                   "Zwróć TYLKO czysty JSON: {\"hasErrors\":true,\"f\":[\"błąd->poprawka\"],\"o\":[{\"l\":\"✨ Poprawnie\",\"t\":\"cały poprawiony tekst\"}]}. " +
+                   "W f max 3 wyrazy, w o 1 opcja. Brak błędów: {\"hasErrors\":false,\"f\":[],\"o\":[]}.";
+        }
+
+        return "Szybki korektor PL. " + styleNote +
+               " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
+               "Zwróć TYLKO czysty JSON: {\"hasErrors\":true,\"f\":[\"błąd->poprawka\"],\"o\":[{\"l\":\"✨ Poprawnie\",\"t\":\"cały poprawiony tekst\"},{\"l\":\"💬 Krócej/inaczej\",\"t\":\"opcjonalny 2. wariant\"}]}. " +
+               "W f max 3 wyrazy, w o max 2 opcje. Brak błędów: {\"hasErrors\":false,\"f\":[],\"o\":[]}.";
     }
 
     public static List<string> DiscoverGeminiModels(string apiKey, out string err)
     {
+        return DiscoverGeminiModels(apiKey, false, out err);
+    }
+
+    public static List<string> DiscoverGeminiModels(string apiKey, bool forceRefresh, out string err)
+    {
         err = null;
+        string cleanKey = AiConfig.SanitizeKey(apiKey);
+        if (!forceRefresh)
+        {
+            lock (metaLock)
+            {
+                if (cachedGeminiModels != null && cachedGeminiModels.Count > 0 &&
+                    cachedGeminiKey == cleanKey && DateTime.UtcNow < cachedGeminiModelsExpiry)
+                {
+                    return new List<string>(cachedGeminiModels);
+                }
+            }
+        }
+
         var found = new List<string>();
         try
         {
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
-            string cleanKey = AiConfig.SanitizeKey(apiKey);
             var headers = new Dictionary<string, string>();
             headers["x-goog-api-key"] = cleanKey;
 
             WebHeaderCollection respHeaders;
-            string json = HttpRequestWithMeta("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100", null, headers, out respHeaders);
+            HttpWebRequest reqOut;
+            string json = HttpRequestWithMeta("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100", null, headers, 7000, out respHeaders, out reqOut);
             var ser = new JavaScriptSerializer();
             ser.MaxJsonLength = 10485760;
             var parsed = ser.Deserialize<Dictionary<string, object>>(json);
@@ -467,6 +536,7 @@ public static class AiCorrectionEngine
                         if (name.IndexOf("tts", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                         if (name.IndexOf("audio", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                         if (name.IndexOf("robotics", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                        if (name.IndexOf("live", StringComparison.OrdinalIgnoreCase) >= 0) continue;
 
                         bool supportsGen = false;
                         if (m.ContainsKey("supportedGenerationMethods"))
@@ -490,6 +560,15 @@ public static class AiCorrectionEngine
             }
 
             found.Sort((a, b) => ScoreGeminiModel(b).CompareTo(ScoreGeminiModel(a)));
+            if (found.Count > 0)
+            {
+                lock (metaLock)
+                {
+                    cachedGeminiModels = new List<string>(found);
+                    cachedGeminiKey = cleanKey;
+                    cachedGeminiModelsExpiry = DateTime.UtcNow.AddMinutes(30);
+                }
+            }
         }
         catch (WebException wex)
         {
@@ -508,17 +587,82 @@ public static class AiCorrectionEngine
         string l = name.ToLower();
         int score = 0;
         if (l.Contains("flash")) score += 500;
-        if (l.Contains("lite")) score += 300;
-        if (l.Contains("3.5")) score += 120;
-        if (l.Contains("flash-lite-latest")) score += 110;
-        if (l.Contains("3.1")) score += 100;
-        if (l.Contains("3.")) score += 80;
-        if (l.Contains("2.5")) score += 40;
-        if (l.Contains("2.0")) score += 30;
-        if (l.Contains("latest") && !l.Contains("lite")) score -= 120;
-        if (l.Contains("pro")) score -= 40;
-        if (l.Contains("exp") || l.Contains("thinking") || l.Contains("preview") || l.Contains("image")) score -= 250;
+        if (l.Contains("lite")) score += 320;
+        if (l.Contains("3.1-flash-lite") && !l.Contains("preview")) score += 160;
+        if (l.Contains("3.5-flash-lite")) score += 135;
+        if (l.Contains("flash-lite-latest")) score += 120;
+        if (l.Contains("3.1")) score += 95;
+        if (l.Contains("3.")) score += 70;
+        if (l.Contains("2.5")) score += 30;
+        if (l.Contains("2.0")) score += 20;
+        if (l.Contains("latest") && !l.Contains("lite")) score -= 140;
+        if (l.Contains("pro") || l.Contains("deep-research")) score -= 200;
+        if (l.Contains("exp") || l.Contains("thinking") || l.Contains("preview") || l.Contains("image") || l.Contains("nano") || l.Contains("lyria") || l.Contains("transcribe") || l.Contains("computer-use")) score -= 300;
         return score;
+    }
+
+    private static string ResolveThinkingMode(string model)
+    {
+        string m = (model ?? "").ToLowerInvariant();
+        lock (metaLock)
+        {
+            string cached;
+            if (thinkingModeCache.TryGetValue(m, out cached)) return cached;
+        }
+        if (m.Contains("2.0") || m.Contains("image") || m.Contains("tts")) return "none";
+        if (m.Contains("3.5") || m.Contains("3.6") || m.Contains("3.7") || m.Contains("3.8") || m.Contains("omni") || m.Contains("flash-lite-latest") || m.Contains("flash-latest"))
+        {
+            return "minimal";
+        }
+        if (m.Contains("3.1") || m.Contains("2.5") || m.Contains("3-flash"))
+        {
+            return "budget0";
+        }
+        return "none";
+    }
+
+    private static void RememberThinkingMode(string model, string mode)
+    {
+        if (string.IsNullOrEmpty(model)) return;
+        lock (metaLock)
+        {
+            thinkingModeCache[model.ToLowerInvariant()] = mode;
+        }
+    }
+
+    private static string GetCachedAi(string cacheKey)
+    {
+        lock (cacheLock)
+        {
+            CacheEntry entry;
+            if (aiCache.TryGetValue(cacheKey, out entry))
+            {
+                if (DateTime.UtcNow < entry.ExpiresUtc) return entry.Value;
+                aiCache.Remove(cacheKey);
+            }
+        }
+        return null;
+    }
+
+    private static void PutCachedAi(string cacheKey, string val)
+    {
+        if (string.IsNullOrEmpty(cacheKey) || string.IsNullOrEmpty(val)) return;
+        lock (cacheLock)
+        {
+            if (aiCache.ContainsKey(cacheKey))
+            {
+                aiCache[cacheKey] = new CacheEntry { Value = val, ExpiresUtc = DateTime.UtcNow.AddMinutes(30) };
+                return;
+            }
+            if (aiCacheOrder.Count >= 250)
+            {
+                string oldest = aiCacheOrder.First.Value;
+                aiCacheOrder.RemoveFirst();
+                aiCache.Remove(oldest);
+            }
+            aiCache[cacheKey] = new CacheEntry { Value = val, ExpiresUtc = DateTime.UtcNow.AddMinutes(30) };
+            aiCacheOrder.AddLast(cacheKey);
+        }
     }
 
     private static string ParseHttpError(WebException wex, out int httpCode)
@@ -573,7 +717,8 @@ public static class AiCorrectionEngine
     public static string CorrectWithAi(string inputText, AiConfig cfg, out string errorMsg, out long elapsedMs)
     {
         string usedModel;
-        string raw = ExecuteAiRequest(BuildSystemPrompt(cfg.Style, false), inputText, false, cfg, out usedModel, out errorMsg, out elapsedMs);
+        int len = (inputText != null) ? inputText.Length : 0;
+        string raw = ExecuteAiRequest(BuildSystemPrompt(cfg.Style, false, len), inputText, false, cfg, out usedModel, out errorMsg, out elapsedMs);
         if (string.IsNullOrWhiteSpace(raw)) return null;
         string cleaned = raw.Trim();
         if (!inputText.TrimStart().StartsWith("\"") && cleaned.StartsWith("\"") && cleaned.EndsWith("\"") && cleaned.Length >= 2)
@@ -586,7 +731,8 @@ public static class AiCorrectionEngine
     public static AiSuggestionResult SuggestWithAi(string inputText, AiConfig cfg, out string errorMsg, out long elapsedMs)
     {
         string usedModel;
-        string raw = ExecuteAiRequest(BuildSystemPrompt(cfg.Style, true), inputText, true, cfg, out usedModel, out errorMsg, out elapsedMs);
+        int len = (inputText != null) ? inputText.Length : 0;
+        string raw = ExecuteAiRequest(BuildSystemPrompt(cfg.Style, true, len), inputText, true, cfg, out usedModel, out errorMsg, out elapsedMs);
         if (string.IsNullOrWhiteSpace(raw)) return null;
 
         var res = ParseSuggestionResponse(raw, inputText);
@@ -698,32 +844,47 @@ public static class AiCorrectionEngine
         try
         {
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+            string cleanKey = AiConfig.SanitizeKey(cfg.ApiKey);
+            string cacheKey = string.Format("{0}|{1}|{2}|{3}|{4}", cfg.Provider, usedModel, cfg.Style, jsonMode ? "1" : "0", inputText);
+            string cached = GetCachedAi(cacheKey);
+            if (!string.IsNullOrEmpty(cached))
+            {
+                sw.Stop();
+                elapsedMs = sw.ElapsedMilliseconds;
+                return cached;
+            }
+
             var ser = new JavaScriptSerializer();
             ser.MaxJsonLength = 10485760;
 
             string resultText = null;
-            string cleanKey = AiConfig.SanitizeKey(cfg.ApiKey);
+            int timeoutMs = (inputText != null && inputText.Length > 650) ? 10500 : 6500;
 
             if (cfg.Provider == "gemini")
             {
-                string primaryModel = string.IsNullOrEmpty(cfg.Model) ? "gemini-3.5-flash-lite" : cfg.Model.Trim();
+                string primaryModel = string.IsNullOrEmpty(cfg.Model) ? "gemini-3.1-flash-lite" : cfg.Model.Trim();
                 usedModel = primaryModel;
                 int errCode = 0;
-                resultText = CallGeminiOnce(primaryModel, cleanKey, sysPrompt, inputText, jsonMode, ser, out errorMsg, out errCode);
 
-                // Retry without strict responseMimeType if a model returns 400 on jsonMode schema constraint
-                if (string.IsNullOrEmpty(resultText) && jsonMode && errCode == 400 && errorMsg != null && errorMsg.IndexOf("API key", StringComparison.OrdinalIgnoreCase) < 0)
+                // Szybka asekuracja równoległa: jeśli główny model nie odpowie w ~1.85s, odpalamy równoległy szybki zapas.
+                string hedgeBackup = PickFastHedgeModel(primaryModel);
+                if (cfg.FastHedgeMode && !string.IsNullOrEmpty(hedgeBackup))
                 {
-                    resultText = CallGeminiOnce(primaryModel, cleanKey, sysPrompt, inputText, false, ser, out errorMsg, out errCode);
+                    int hedgeDelayMs = (inputText != null && inputText.Length > 350) ? 1750 : 1050;
+                    resultText = ExecuteGeminiHedged(primaryModel, hedgeBackup, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, hedgeDelayMs, out usedModel, out errorMsg, out errCode);
+                }
+                else
+                {
+                    resultText = CallGeminiSmart(primaryModel, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, null, out errorMsg, out errCode);
                 }
 
-                // Auto-discover & fallback on timeout/drop (0), 404 (deprecated/not found), 429 (quota/tier), or 400 model issue (never on API_KEY_INVALID)
+                // Fallback na liste odkrytych modeli przy twardych bledach/limicie
                 bool isInvalidKey = (errorMsg != null && (errorMsg.IndexOf("API key", StringComparison.OrdinalIgnoreCase) >= 0 || errorMsg.IndexOf("API_KEY", StringComparison.OrdinalIgnoreCase) >= 0));
                 if (string.IsNullOrEmpty(resultText) && !isInvalidKey &&
                     (errCode == 0 || errCode == 404 || errCode == 429 || errCode == 503 || errCode == 400))
                 {
                     string discErr;
-                    var models = DiscoverGeminiModels(cleanKey, out discErr);
+                    var models = DiscoverGeminiModels(cleanKey, false, out discErr);
                     int tries = 0;
                     foreach (string alt in models)
                     {
@@ -733,7 +894,7 @@ public static class AiCorrectionEngine
 
                         string altErr;
                         int altCode;
-                        string altRes = CallGeminiOnce(alt, cleanKey, sysPrompt, inputText, jsonMode, ser, out altErr, out altCode);
+                        string altRes = CallGeminiSmart(alt, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, null, out altErr, out altCode);
                         if (!string.IsNullOrEmpty(altRes))
                         {
                             resultText = altRes;
@@ -775,7 +936,8 @@ public static class AiCorrectionEngine
                 }
 
                 WebHeaderCollection respHeaders;
-                string respJson = HttpRequestWithMeta("POST", url, body, headers, out respHeaders);
+                HttpWebRequest reqOut;
+                string respJson = HttpRequestWithMeta("POST", url, body, headers, timeoutMs, out respHeaders, out reqOut);
                 var parsed = ser.Deserialize<Dictionary<string, object>>(respJson);
 
                 int pTok = 0, cTok = 0, tTok = 0;
@@ -815,9 +977,11 @@ public static class AiCorrectionEngine
                 return null;
             }
 
+            string trimmed = resultText.Trim();
+            PutCachedAi(cacheKey, trimmed);
             sw.Stop();
             elapsedMs = sw.ElapsedMilliseconds;
-            return resultText.Trim();
+            return trimmed;
         }
         catch (WebException wex)
         {
@@ -837,12 +1001,151 @@ public static class AiCorrectionEngine
         return null;
     }
 
-    private static string CallGeminiOnce(string model, string cleanKey, string sysPrompt, string inputText, bool jsonMode, JavaScriptSerializer ser, out string errorMsg, out int httpCode)
+    private static string PickFastHedgeModel(string primaryModel)
+    {
+        string p = (primaryModel ?? "").ToLowerInvariant();
+        string[] pool = new string[] { "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest" };
+        foreach (string cand in pool)
+        {
+            if (!cand.Equals(p, StringComparison.OrdinalIgnoreCase)) return cand;
+        }
+        return null;
+    }
+
+    private static string ExecuteGeminiHedged(
+        string primaryModel, string backupModel, string cleanKey, string sysPrompt, string inputText,
+        bool jsonMode, int timeoutMs, int hedgeDelayMs, out string usedModel, out string errorMsg, out int errCode)
+    {
+        usedModel = primaryModel;
+        errorMsg = null;
+        errCode = 0;
+
+        object winLock = new object();
+        int winnerState = 0; // 0=pending, 1=done success, 2=both done failed
+        int finishedCount = 0;
+        bool needBoth = false;
+        string winText = null, winModel = primaryModel, lastErr = null;
+        int lastCode = 0;
+        HttpWebRequest reqPrimary = null;
+        HttpWebRequest reqBackup = null;
+        var doneEvent = new ManualResetEvent(false);
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string e; int c;
+            string r = CallGeminiSmart(primaryModel, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, req => { lock (winLock) reqPrimary = req; }, out e, out c);
+            lock (winLock)
+            {
+                finishedCount++;
+                if (winnerState == 0 && !string.IsNullOrEmpty(r))
+                {
+                    winnerState = 1;
+                    winText = r;
+                    winModel = primaryModel;
+                    try { if (reqBackup != null) reqBackup.Abort(); } catch { }
+                    doneEvent.Set();
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(e)) { lastErr = e; lastCode = c; }
+                    if (!needBoth || finishedCount >= 2)
+                    {
+                        if (winnerState == 0) winnerState = 2;
+                        doneEvent.Set();
+                    }
+                }
+            }
+        });
+
+        if (!doneEvent.WaitOne(hedgeDelayMs))
+        {
+            bool launchBackup = false;
+            lock (winLock)
+            {
+                if (winnerState == 0)
+                {
+                    needBoth = true;
+                    launchBackup = true;
+                }
+            }
+
+            if (launchBackup)
+            {
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    string e; int c;
+                    string r = CallGeminiSmart(backupModel, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, req => { lock (winLock) reqBackup = req; }, out e, out c);
+                    lock (winLock)
+                    {
+                        finishedCount++;
+                        if (winnerState == 0 && !string.IsNullOrEmpty(r))
+                        {
+                            winnerState = 1;
+                            winText = r;
+                            winModel = backupModel;
+                            try { if (reqPrimary != null) reqPrimary.Abort(); } catch { }
+                            doneEvent.Set();
+                        }
+                        else
+                        {
+                            if (!string.IsNullOrEmpty(e) && string.IsNullOrEmpty(lastErr)) { lastErr = e; lastCode = c; }
+                            if (finishedCount >= 2)
+                            {
+                                if (winnerState == 0) winnerState = 2;
+                                doneEvent.Set();
+                            }
+                        }
+                    }
+                });
+            }
+            doneEvent.WaitOne(timeoutMs + 800);
+        }
+
+        doneEvent.Close();
+        usedModel = winModel;
+        errorMsg = lastErr;
+        errCode = lastCode;
+        return winText;
+    }
+
+    private static string CallGeminiSmart(string model, string cleanKey, string sysPrompt, string inputText, bool jsonMode, int timeoutMs, Action<HttpWebRequest> onReqCreated, out string errorMsg, out int httpCode)
+    {
+        string thinkMode = ResolveThinkingMode(model);
+        string res = CallGeminiOnce(model, cleanKey, sysPrompt, inputText, jsonMode, thinkMode, timeoutMs, onReqCreated, out errorMsg, out httpCode);
+        if (!string.IsNullOrEmpty(res)) return res;
+
+        // Jesli thinkingConfig wywolal HTTP 400 na nowym/nieznanym modelu, przejdz automatycznie i zapamietaj
+        if (httpCode == 400 && errorMsg != null && errorMsg.IndexOf("API key", StringComparison.OrdinalIgnoreCase) < 0 && thinkMode != "none")
+        {
+            string nextMode = (thinkMode == "budget0") ? "minimal" : "none";
+            RememberThinkingMode(model, nextMode);
+            res = CallGeminiOnce(model, cleanKey, sysPrompt, inputText, jsonMode, nextMode, timeoutMs, onReqCreated, out errorMsg, out httpCode);
+            if (!string.IsNullOrEmpty(res)) return res;
+
+            if (httpCode == 400 && nextMode != "none")
+            {
+                RememberThinkingMode(model, "none");
+                res = CallGeminiOnce(model, cleanKey, sysPrompt, inputText, jsonMode, "none", timeoutMs, onReqCreated, out errorMsg, out httpCode);
+                if (!string.IsNullOrEmpty(res)) return res;
+            }
+        }
+
+        if (string.IsNullOrEmpty(res) && jsonMode && httpCode == 400 && errorMsg != null && errorMsg.IndexOf("API key", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            res = CallGeminiOnce(model, cleanKey, sysPrompt, inputText, false, ResolveThinkingMode(model), timeoutMs, onReqCreated, out errorMsg, out httpCode);
+        }
+        return res;
+    }
+
+    private static string CallGeminiOnce(string model, string cleanKey, string sysPrompt, string inputText, bool jsonMode, string thinkMode, int timeoutMs, Action<HttpWebRequest> onReqCreated, out string errorMsg, out int httpCode)
     {
         errorMsg = null;
         httpCode = 0;
         try
         {
+            var ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = 10485760;
+
             string url = string.Format("https://generativelanguage.googleapis.com/v1beta/models/{0}:generateContent", model);
             var headers = new Dictionary<string, string>();
             headers["x-goog-api-key"] = cleanKey;
@@ -858,13 +1161,24 @@ public static class AiCorrectionEngine
             payload["contents"] = new object[] { content };
 
             var genCfg = new Dictionary<string, object>();
-            genCfg["temperature"] = 0.15;
+            genCfg["temperature"] = 0.1;
+            int inLen = (inputText != null) ? inputText.Length : 100;
+            genCfg["maxOutputTokens"] = jsonMode ? Math.Max(220, Math.Min(2048, inLen * 2 + 220)) : Math.Max(128, Math.Min(2048, inLen * 2 + 120));
             if (jsonMode) genCfg["responseMimeType"] = "application/json";
+            if (thinkMode == "minimal")
+            {
+                genCfg["thinkingConfig"] = new Dictionary<string, object> { { "thinkingLevel", "minimal" } };
+            }
+            else if (thinkMode == "budget0")
+            {
+                genCfg["thinkingConfig"] = new Dictionary<string, object> { { "thinkingBudget", 0 } };
+            }
             payload["generationConfig"] = genCfg;
 
             string body = ser.Serialize(payload);
             WebHeaderCollection respHeaders;
-            string respJson = HttpRequestWithMeta("POST", url, body, headers, out respHeaders);
+            HttpWebRequest reqRef;
+            string respJson = HttpRequestWithMeta("POST", url, body, headers, timeoutMs, out respHeaders, out reqRef, onReqCreated);
             var parsed = ser.Deserialize<Dictionary<string, object>>(respJson);
 
             int pTok = 0, cTok = 0, tTok = 0;
@@ -910,6 +1224,11 @@ public static class AiCorrectionEngine
         }
         catch (WebException wex)
         {
+            if (wex.Status == WebExceptionStatus.RequestCanceled)
+            {
+                errorMsg = "Anulowano wolniejsze zapytanie.";
+                return null;
+            }
             errorMsg = ParseHttpError(wex, out httpCode);
             WebHeaderCollection errHdrs = (wex.Response != null) ? wex.Response.Headers : null;
             AiUsageTracker.RecordResponse("gemini", model, false, httpCode, 0, 0, 0, errHdrs, errorMsg);
@@ -922,16 +1241,18 @@ public static class AiCorrectionEngine
         return null;
     }
 
-    private static string HttpRequestWithMeta(string method, string url, string jsonBody, Dictionary<string, string> extraHeaders, out WebHeaderCollection respHeaders)
+    private static string HttpRequestWithMeta(string method, string url, string jsonBody, Dictionary<string, string> extraHeaders, int timeoutMs, out WebHeaderCollection respHeaders, out HttpWebRequest reqOut, Action<HttpWebRequest> onReqCreated = null)
     {
         respHeaders = null;
         HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+        reqOut = req;
+        if (onReqCreated != null) onReqCreated(req);
         req.Method = method;
         req.Proxy = null;
         req.KeepAlive = true;
         req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
-        req.Timeout = 14000;
-        req.ReadWriteTimeout = 14000;
+        req.Timeout = timeoutMs;
+        req.ReadWriteTimeout = timeoutMs;
         if (extraHeaders != null)
         {
             foreach (var kv in extraHeaders) req.Headers[kv.Key] = kv.Value;
@@ -1115,16 +1436,44 @@ public class SpacjomatContext : ApplicationContext
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, [MarshalAs(UnmanagedType.LPArray), In] INPUT[] pInputs, int cbSize);
 
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private const int SW_SHOWNOACTIVATE = 4;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
+    public static void ShowTopmostNoActivate(Form f)
+    {
+        if (f == null || f.IsDisposed) return;
+        try
+        {
+            if (!f.Visible) ShowWindow(f.Handle, SW_SHOWNOACTIVATE);
+            SetWindowPos(f.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        catch { }
+    }
+
     // Knowledge Base & State
     public static Dictionary<string, string> directRules = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     public static Dictionary<string, string> bigramRules = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     public static HashSet<string> whitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public static Dictionary<string, int> dictionary = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     public static Dictionary<string, List<string>> strippedDict = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-    public static Dictionary<int, List<KeyValuePair<string, int>>> wordsByLength = new Dictionary<int, List<KeyValuePair<string, int>>>();
+    public static Dictionary<int, Dictionary<char, List<KeyValuePair<string, int>>>> wordsByLenAndChar = new Dictionary<int, Dictionary<char, List<KeyValuePair<string, int>>>>();
+    public static Dictionary<int, List<KeyValuePair<string, int>>> topWordsByLength = new Dictionary<int, List<KeyValuePair<string, int>>>();
     public static HashSet<string> sessionIgnored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private static ulong[] sjpHashes = new ulong[0];
     private static bool sjpIs48Bit = false;
+    public static int learnedRulesCount = 0;
 
     public static HashSet<string> ambiguousKeepAscii = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "ze", "sa", "nadal", "sama", "sprawie", "pojawia", "jakich", "czesc", "wlasna", "mala", "duza", "nowa", "stara",
@@ -1156,9 +1505,12 @@ public class SpacjomatContext : ApplicationContext
     private static IntPtr lastForegroundHwnd = IntPtr.Zero;
     private static IntPtr lastFocusHwnd = IntPtr.Zero;
     private static bool suppressNextKUp = false;
+    private static bool suppressNextLUp = false;
     private static bool suppressNextF7Up = false;
     private static bool suppressNextF8Up = false;
     private static bool suppressNextF9Up = false;
+    private static readonly byte[] hookKeyState = new byte[256];
+    private static readonly StringBuilder hookCharBuffer = new StringBuilder(10);
     private static EventWaitHandle pingEvent = null;
     private static volatile bool stopPingThread = false;
 
@@ -1172,6 +1524,7 @@ public class SpacjomatContext : ApplicationContext
     private ToolStripMenuItem modeMenuItem;
     private ToolStripMenuItem pillMenuItem;
     private ToolStripMenuItem suggestModeMenuItem;
+    private ToolStripMenuItem autostartMenuItem;
     private Icon appIcon;
     private SpacjomatStudioForm studioWindow = null;
     private AiSettingsForm settingsWindow = null;
@@ -1194,6 +1547,11 @@ public class SpacjomatContext : ApplicationContext
     private static int slowHookCount = 0;
     private static int lastHookTick = 0;
     private static int lastHookVk = 0;
+    private static int lastAiTriggerTick = 0;
+    private static int lastOfflineTriggerTick = 0;
+    private static volatile bool isSessionLocked = false;
+    private static volatile bool isSuspended = false;
+    public static volatile bool IntentionalExit = false;
     private System.Windows.Forms.Timer watchdogTimer = null;
     private System.Windows.Forms.Timer targetTrackTimer = null;
     private System.Windows.Forms.Timer delayedRehookTimer = null;
@@ -1244,14 +1602,14 @@ public class SpacjomatContext : ApplicationContext
     {
         if (target == IntPtr.Zero) return;
         bool switched = false;
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 6; i++)
         {
             if (GetForegroundWindow() == target) break;
             SetForegroundWindow(target);
             switched = true;
-            Thread.Sleep(40);
+            Thread.Sleep(22);
         }
-        if (switched) Thread.Sleep(70);
+        if (switched) Thread.Sleep(35);
     }
 
     private static bool InstallHook()
@@ -1282,7 +1640,12 @@ public class SpacjomatContext : ApplicationContext
     // Windows po cichu wylacza hak klawiatury po uspieniu, blokadzie sesji albo zbyt wolnym callbacku.
     private static void ReinstallHookSafe(string reason)
     {
-        if (isSimulatingInput) return;
+        if (isSimulatingInput || isSessionLocked || isSuspended) return;
+        // Nie zdejmuj dzialajacego haka w polowie wpisywanego slowa podczas rutynowego watchdoga.
+        if (reason == "watchdog" && currentWord.Length > 0 && lastHookTick != 0 && unchecked(Environment.TickCount - lastHookTick) < 2500)
+        {
+            return;
+        }
         if (InstallHook())
         {
             hookReinstallCount++;
@@ -1323,12 +1686,12 @@ public class SpacjomatContext : ApplicationContext
         catch { }
     }
 
-    private void EnsureHotkeysRegistered()
+    private void EnsureHotkeysRegistered(bool forceReRegister = false)
     {
         try
         {
             if (hotkeyWindow == null) { hotkeyWindow = new HotkeyWindow(); return; }
-            hotkeyWindow.EnsureRegistered();
+            hotkeyWindow.EnsureRegistered(forceReRegister);
         }
         catch (Exception ex) { Log("Stability: ponowna rejestracja skrotow nie powiodla sie: " + ex.Message); }
     }
@@ -1341,14 +1704,18 @@ public class SpacjomatContext : ApplicationContext
             if (delayedRehookTimer == null)
             {
                 delayedRehookTimer = new System.Windows.Forms.Timer();
-                delayedRehookTimer.Interval = 1500;
+                delayedRehookTimer.Interval = 1400;
                 delayedRehookTimer.Tick += (s2, e2) =>
                 {
                     delayedRehookTimer.Stop();
-                    ReinstallHookSafe("po zdarzeniu systemowym");
-                    EnsureHotkeysRegistered();
-                    EnsureOnScreen(grammarlyPill);
-                    EnsureOnScreen(suggestionPopup);
+                    if (!isSessionLocked && !isSuspended)
+                    {
+                        ReinstallHookSafe("po zdarzeniu systemowym");
+                        EnsureHotkeysRegistered(true);
+                        EnsureOnScreen(grammarlyPill);
+                        EnsureOnScreen(suggestionPopup);
+                        AiCorrectionEngine.WarmUpConnectionAsync(aiConfig);
+                    }
                 };
             }
             delayedRehookTimer.Stop();
@@ -1372,11 +1739,22 @@ public class SpacjomatContext : ApplicationContext
                 try
                 {
                     watchdogTicks++;
-                    if (hookId == IntPtr.Zero) ReinstallHookSafe("brak haka");
-                    else if (watchdogTicks % 3 == 0) ReinstallHookSafe("watchdog");
-                    EnsureHotkeysRegistered();
+                    if (!isSessionLocked && !isSuspended)
+                    {
+                        if (hookId == IntPtr.Zero) ReinstallHookSafe("brak haka");
+                        else if (watchdogTicks % 3 == 0) ReinstallHookSafe("watchdog");
+                        EnsureHotkeysRegistered(false);
+                        EnsurePillAlwaysOnDesktop();
+                    }
+
+                    // Utrzymuj cieply TLS do AI, jesli uzytkownik pisal w ciagu ostatnich 10 minut
+                    if (lastHookTick != 0 && unchecked(Environment.TickCount - lastHookTick) < 600000)
+                    {
+                        AiCorrectionEngine.MaybeKeepAliveAsync(aiConfig);
+                    }
+
                     if (Interlocked.CompareExchange(ref correctionRunning, 0, 0) != 0 &&
-                        unchecked(Environment.TickCount - correctionStartTick) > 45000)
+                        unchecked(Environment.TickCount - correctionStartTick) > 22000)
                     {
                         Log("Stability: watchdog zwolnil zawieszona korekte.");
                         Interlocked.Exchange(ref correctionRunning, 0);
@@ -1389,18 +1767,94 @@ public class SpacjomatContext : ApplicationContext
 
             Microsoft.Win32.SystemEvents.PowerModeChanged += (s, e) =>
             {
-                if (e.Mode == Microsoft.Win32.PowerModes.Resume) ScheduleRehook("wznowienie z uspienia");
+                if (e.Mode == Microsoft.Win32.PowerModes.Suspend)
+                {
+                    isSuspended = true;
+                }
+                else if (e.Mode == Microsoft.Win32.PowerModes.Resume)
+                {
+                    isSuspended = false;
+                    isSessionLocked = false;
+                    ScheduleRehook("wznowienie z uspienia");
+                }
             };
             Microsoft.Win32.SystemEvents.SessionSwitch += (s, e) =>
             {
-                if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionUnlock ||
+                if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLock)
+                {
+                    isSessionLocked = true;
+                }
+                else if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionUnlock ||
                     e.Reason == Microsoft.Win32.SessionSwitchReason.ConsoleConnect ||
                     e.Reason == Microsoft.Win32.SessionSwitchReason.RemoteConnect ||
-                    e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLogon) ScheduleRehook("odblokowanie sesji");
+                    e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLogon)
+                {
+                    isSessionLocked = false;
+                    isSuspended = false;
+                    ScheduleRehook("odblokowanie sesji");
+                }
             };
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged += (s, e) => ScheduleRehook("zmiana ekranow / dokowania");
         }
         catch (Exception ex) { Log("Stability: StartStabilityWatchdogs error: " + ex.Message); }
+    }
+
+    private static string GetAutostartShortcutPath()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Spacjomat.lnk");
+    }
+
+    public static bool IsAutostartEnabled()
+    {
+        try { return File.Exists(GetAutostartShortcutPath()); } catch { return false; }
+    }
+
+    public static bool SetAutostart(bool enable)
+    {
+        try
+        {
+            string lnkPath = GetAutostartShortcutPath();
+            if (!enable)
+            {
+                if (File.Exists(lnkPath)) File.Delete(lnkPath);
+                return true;
+            }
+            string appDir = GetAppDir().TrimEnd('\\');
+            string vbsPath = Path.Combine(appDir, "Spacjomat.vbs");
+            string icoPath = Path.Combine(appDir, "Spacjomat.ico");
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null) return false;
+            object shell = Activator.CreateInstance(shellType);
+            object lnk = shellType.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnkPath });
+            Type lnkType = lnk.GetType();
+            lnkType.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { "wscript.exe" });
+            lnkType.InvokeMember("Arguments", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { "\"" + vbsPath + "\"" });
+            lnkType.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { appDir });
+            if (File.Exists(icoPath))
+            {
+                lnkType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { icoPath });
+            }
+            lnkType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, lnk, null);
+            return File.Exists(lnkPath);
+        }
+        catch (Exception ex)
+        {
+            Log("Autostart error: " + ex.Message);
+            return false;
+        }
+    }
+
+    private void EnsurePillAlwaysOnDesktop()
+    {
+        try
+        {
+            if (aiConfig != null && aiConfig.ShowPill && grammarlyPill != null && !grammarlyPill.IsDisposed)
+            {
+                EnsureOnScreen(grammarlyPill);
+                ShowTopmostNoActivate(grammarlyPill);
+            }
+        }
+        catch { }
     }
 
     private static bool IsRunningAsAdmin()
@@ -1437,18 +1891,19 @@ public class SpacjomatContext : ApplicationContext
             ? "jeszcze zaden"
             : string.Format("0x{0:X2} ({1}), {2:0.0} s temu", lastHookVk, ((Keys)lastHookVk).ToString(), unchecked(Environment.TickCount - lastHookTick) / 1000.0);
         sb.AppendLine("Ostatni klawisz widziany przez Spacjomat: " + lastKey);
-        sb.AppendLine("AI (F7 / Ctrl+Shift+L): " + (AiCorrectionEngine.IsAiReady(aiConfig) ? "gotowe" : "wylaczone (wklej klucz w ustawieniach)"));
-        sb.AppendLine("Uprawnienia: " + (IsRunningAsAdmin() ? "Administrator" : "zwykly uzytkownik"));
+        string aiModelName = (aiConfig != null && !string.IsNullOrEmpty(aiConfig.Model)) ? aiConfig.Model : "-";
+        sb.AppendLine("AI (F7 / Ctrl+Shift+L): " + (AiCorrectionEngine.IsAiReady(aiConfig) ? ("gotowe (" + aiModelName + ", TurboHedge=" + (aiConfig.FastHedgeMode ? "WL" : "WYL") + ")") : "wylaczone (wklej klucz w ustawieniach)"));
+        sb.AppendLine(string.Format("Baza Offline: {0:N0} regul (w tym {1} wyuczonych z AI) | {2:N0} slow | {3:N0} bigramow | {4} wyjatkow",
+            directRules.Count, learnedRulesCount, dictionary.Count, bigramRules.Count, whitelist.Count));
+        sb.AppendLine("Uprawnienia: " + (IsRunningAsAdmin() ? "Administrator (pelny dostep takze do okien Admin)" : "zwykly uzytkownik"));
         sb.AppendLine("Folder: " + GetAppDir() + (IsAppDirWritable() ? "" : "   (BRAK ZAPISU!)"));
         sb.AppendLine();
-        sb.AppendLine("JAK PRZETESTOWAC: naciśnij F7 w dowolnym oknie, potem otworz diagnostyke ponownie.");
+        sb.AppendLine("JAK PRZETESTOWAC: nacisnij F7 w dowolnym oknie, potem otworz diagnostyke ponownie.");
         sb.AppendLine("Jesli 'ostatni klawisz' nie jest F7 / F8, to klawisz nie dociera do Windows");
         sb.AppendLine("(laptop z wlaczonym Fn Lock albo klawiatura wysyla funkcje multimedialne).");
         sb.AppendLine("Wtedy uzyj Fn+F7 / Fn+F8 albo skrotow, ktore dzialaja zawsze:");
         sb.AppendLine("   Ctrl+Shift+L = AI (zamiast F7)");
         sb.AppendLine("   Ctrl+Shift+K = baza Offline (zamiast F8)");
-        sb.AppendLine();
-        sb.AppendLine("Aplikacje uruchomione jako Administrator wymagaja, by Spacjomat tez byl Administratorem.");
         MessageBox.Show(sb.ToString(), "Spacjomat - diagnostyka", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
@@ -1590,6 +2045,17 @@ public class SpacjomatContext : ApplicationContext
         pillMenuItem.Checked = aiConfig.ShowPill;
         trayMenu.Items.Add(pillMenuItem);
 
+        autostartMenuItem = new ToolStripMenuItem("🚀 Uruchamiaj z Windows (Autostart)", null, (s, e) => {
+            bool target = !IsAutostartEnabled();
+            if (SetAutostart(target))
+            {
+                autostartMenuItem.Checked = target;
+                if (floatingBanner != null) floatingBanner.ShowMessage(target ? "🚀 Autostart WŁĄCZONY — Spacjomat będzie zawsze startował z Windows!" : "Autostart wyłączony.");
+            }
+        });
+        autostartMenuItem.Checked = IsAutostartEnabled();
+        trayMenu.Items.Add(autostartMenuItem);
+
         suggestModeMenuItem = new ToolStripMenuItem("Tryb Grammarly: Pokazuj podpowiedzi do wyboru", null, (s, e) => ToggleSuggestMode());
         suggestModeMenuItem.Checked = (aiConfig.CorrectionMode != "auto");
         trayMenu.Items.Add(suggestModeMenuItem);
@@ -1609,9 +2075,20 @@ public class SpacjomatContext : ApplicationContext
 
         trayMenu.Items.Add("🔄 Uruchom ponownie (Restart)", null, (s, e) => RestartApplication());
         trayMenu.Items.Add("🩺 Diagnostyka (gdy F7/F8 nie działa)", null, (s, e) => ShowDiagnostics());
+        trayMenu.Items.Add("📚 Otwórz wyuczone słowa (AI -> Offline)", null, (s, e) => {
+            try {
+                string lp = Path.Combine(GetAppDir(), "nauczone_reguly.txt");
+                if (!File.Exists(lp)) File.WriteAllText(lp, "# Słowa wyuczone automatycznie z korekt AI (F7)\r\n", new UTF8Encoding(false));
+                System.Diagnostics.Process.Start("notepad.exe", lp);
+            } catch { }
+        });
 
         trayMenu.Items.Add(new ToolStripSeparator());
-        trayMenu.Items.Add("Zakończ Spacjomat", null, (s, e) => ExitThread());
+        trayMenu.Items.Add("Zakończ Spacjomat", null, (s, e) => {
+            IntentionalExit = true;
+            try { Environment.ExitCode = 99; } catch { }
+            ExitThread();
+        });
 
         trayIcon = new NotifyIcon();
         trayIcon.Text = "Spacjomat - Hybrydowa Autokorekta AI + Offline";
@@ -1732,6 +2209,8 @@ public class SpacjomatContext : ApplicationContext
 
     public void RestartApplication()
     {
+        IntentionalExit = true;
+        try { Environment.ExitCode = 99; } catch { }
         try
         {
             string vbsPath = Path.Combine(GetAppDir(), "Spacjomat.vbs");
@@ -1942,20 +2421,32 @@ public class SpacjomatContext : ApplicationContext
 
     private static void ReleaseAllModifiers()
     {
-        SendKeyInput(0xA0, 0x2A, true, false); // VK_LSHIFT UP
-        SendKeyInput(0xA1, 0x36, true, true);  // VK_RSHIFT UP
-        SendKeyInput(0x10, 0x2A, true, false); // VK_SHIFT UP
-        SendKeyInput(0xA4, 0x38, true, false); // VK_LMENU UP
-        SendKeyInput(0xA5, 0x38, true, true);  // VK_RMENU UP
-        SendKeyInput(0x12, 0x38, true, false); // VK_MENU UP
-        SendKeyInput(0xA2, 0x1D, true, false); // VK_LCONTROL UP
-        SendKeyInput(0xA3, 0x1D, true, true);  // VK_RCONTROL UP
-        SendKeyInput(0x11, 0x1D, true, false); // VK_CONTROL UP
+        ushort[] vks   = { 0xA0, 0xA1, 0x10, 0xA4, 0xA5, 0x12, 0xA2, 0xA3, 0x11 };
+        ushort[] scans = { 0x2A, 0x36, 0x2A, 0x38, 0x38, 0x38, 0x1D, 0x1D, 0x1D };
+        bool[]   ext   = { false, true, false, false, true, false, false, true, false };
+
+        var batch = new List<INPUT>(9);
+        for (int i = 0; i < vks.Length; i++)
+        {
+            if ((GetAsyncKeyState(vks[i]) & 0x8000) != 0)
+            {
+                INPUT inp = new INPUT();
+                inp.type = INPUT_KEYBOARD;
+                inp.ki.wVk = vks[i];
+                inp.ki.wScan = scans[i];
+                inp.ki.dwFlags = KEYEVENTF_KEYUP | (ext[i] ? KEYEVENTF_EXTENDEDKEY : 0u);
+                batch.Add(inp);
+            }
+        }
+        if (batch.Count > 0)
+        {
+            SendInput((uint)batch.Count, batch.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+        }
     }
 
     private static void WaitForModifiersReleased(int maxWaitMs)
     {
-        int[] keys = new int[] { 0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, VK_K, VK_F7, VK_F8 };
+        int[] keys = new int[] { 0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5 };
         int elapsed = 0;
         while (elapsed < maxWaitMs)
         {
@@ -1969,43 +2460,61 @@ public class SpacjomatContext : ApplicationContext
                 }
             }
             if (!anyDown) break;
-            Thread.Sleep(10);
-            elapsed += 10;
+            Thread.Sleep(8);
+            elapsed += 8;
         }
     }
 
     private static void SimulateCtrlCombo(ushort vkKey, ushort scanKey)
     {
-        ReleaseAllModifiers();
-        Thread.Sleep(12);
+        isSimulatingInput = true;
+        try
+        {
+            ReleaseAllModifiers();
+            Thread.Sleep(6);
 
-        SendKeyInput(0xA2, 0x1D, false, false); // LCtrl DOWN
-        Thread.Sleep(16);
+            SendKeyInput(0xA2, 0x1D, false, false); // LCtrl DOWN
+            Thread.Sleep(10);
 
-        SendKeyInput(vkKey, scanKey, false, false); // Key DOWN
-        Thread.Sleep(12);
+            SendKeyInput(vkKey, scanKey, false, false); // Key DOWN
+            Thread.Sleep(8);
 
-        SendKeyInput(vkKey, scanKey, true, false);  // Key UP
-        Thread.Sleep(10);
+            SendKeyInput(vkKey, scanKey, true, false);  // Key UP
+            Thread.Sleep(6);
 
-        SendKeyInput(0xA2, 0x1D, true, false);  // LCtrl UP
+            SendKeyInput(0xA2, 0x1D, true, false);  // LCtrl UP
+        }
+        finally
+        {
+            isSimulatingInput = false;
+        }
     }
 
-    private static string PollClipboardText(int maxPolls, int delayMs)
+    private static string PollClipboardAfterCopy(uint seqBefore, int maxWaitMs)
     {
-        for (int i = 0; i < maxPolls; i++)
+        int elapsed = 0;
+        while (elapsed < maxWaitMs)
         {
-            Thread.Sleep(delayMs);
-            try
+            Thread.Sleep(4);
+            elapsed += 4;
+            if (GetClipboardSequenceNumber() != seqBefore)
             {
-                IDataObject iData = Clipboard.GetDataObject();
-                if (iData != null && iData.GetDataPresent(DataFormats.UnicodeText))
+                for (int r = 0; r < 4; r++)
                 {
-                    string txt = (string)iData.GetData(DataFormats.UnicodeText);
-                    if (!string.IsNullOrEmpty(txt)) return txt;
+                    try
+                    {
+                        IDataObject iData = Clipboard.GetDataObject();
+                        if (iData != null && iData.GetDataPresent(DataFormats.UnicodeText))
+                        {
+                            string txt = (string)iData.GetData(DataFormats.UnicodeText);
+                            if (!string.IsNullOrEmpty(txt)) return txt;
+                        }
+                    }
+                    catch { }
+                    Thread.Sleep(4);
                 }
+                return null;
             }
-            catch { }
         }
         return null;
     }
@@ -2019,7 +2528,7 @@ public class SpacjomatContext : ApplicationContext
     private static void RestoreClipboardSafe(bool hadBackup, string backupText)
     {
         if (!hadBackup || backupText == null) return;
-        try { Clipboard.SetDataObject(backupText, true, 4, 35); } catch { }
+        try { Clipboard.SetDataObject(backupText, true, 4, 25); } catch { }
     }
 
     private static void PasteTextIntoTarget(string textToPaste, IntPtr targetHwnd, bool reselectAll, bool hadBackup, string backupText, string bannerMsg)
@@ -2027,13 +2536,13 @@ public class SpacjomatContext : ApplicationContext
         if (targetHwnd != IntPtr.Zero && GetForegroundWindow() != targetHwnd)
         {
             SetForegroundWindow(targetHwnd);
-            Thread.Sleep(55);
+            Thread.Sleep(35);
         }
 
         if (reselectAll)
         {
             SimulateSelectAll();
-            Thread.Sleep(55);
+            Thread.Sleep(30);
         }
 
         bool clipSet = false;
@@ -2041,11 +2550,11 @@ public class SpacjomatContext : ApplicationContext
         {
             try
             {
-                Clipboard.SetDataObject(textToPaste, true, 5, 40);
+                Clipboard.SetDataObject(textToPaste, true, 5, 25);
                 clipSet = true;
                 break;
             }
-            catch { Thread.Sleep(30); }
+            catch { Thread.Sleep(15); }
         }
 
         if (!clipSet)
@@ -2054,7 +2563,7 @@ public class SpacjomatContext : ApplicationContext
             return;
         }
 
-        Thread.Sleep(45);
+        Thread.Sleep(25);
         SimulatePaste();
 
         if (floatingBanner != null && !string.IsNullOrEmpty(bannerMsg))
@@ -2064,7 +2573,7 @@ public class SpacjomatContext : ApplicationContext
 
         if (hadBackup && backupText != null)
         {
-            Thread.Sleep(320);
+            Thread.Sleep(220);
             RestoreClipboardSafe(true, backupText);
         }
     }
@@ -2078,7 +2587,6 @@ public class SpacjomatContext : ApplicationContext
             bool hadBackup = false;
             try
             {
-                isSimulatingInput = true;
                 try
                 {
                     if (Clipboard.ContainsText())
@@ -2107,6 +2615,18 @@ public class SpacjomatContext : ApplicationContext
 
     public static void TriggerInPlaceCorrection(bool useAi, bool selectAllFirst, bool autoSelectAllIfEmpty)
     {
+        int nowTick = Environment.TickCount;
+        if (useAi)
+        {
+            if (unchecked(nowTick - lastAiTriggerTick) < 320) return;
+            lastAiTriggerTick = nowTick;
+        }
+        else
+        {
+            if (unchecked(nowTick - lastOfflineTriggerTick) < 320) return;
+            lastOfflineTriggerTick = nowTick;
+        }
+
         if (useAi && !AiCorrectionEngine.IsAiReady(aiConfig))
         {
             if (floatingBanner != null)
@@ -2119,9 +2639,8 @@ public class SpacjomatContext : ApplicationContext
         if (Interlocked.CompareExchange(ref correctionRunning, 1, 0) != 0)
         {
             int runningMs = unchecked(Environment.TickCount - correctionStartTick);
-            if (runningMs > 40000)
+            if (runningMs > 22000)
             {
-                // Poprzednia korekta wisi (np. zawieszone API) - zwolnij blokade i sprobuj ponownie.
                 Log("Stability: wymuszone zwolnienie zawieszonej korekty (" + runningMs + " ms).");
                 Interlocked.Exchange(ref correctionRunning, 0);
                 isSimulatingInput = false;
@@ -2136,8 +2655,6 @@ public class SpacjomatContext : ApplicationContext
 
         correctionStartTick = Environment.TickCount;
         int myGen = Interlocked.Increment(ref correctionGen);
-
-        // Okno docelowe: to, w ktorym piszesz - takze gdy klikasz pigulke albo menu przy zegarku.
         IntPtr capturedTargetHwnd = ResolveTargetWindow();
 
         Thread worker = new Thread(() =>
@@ -2146,10 +2663,9 @@ public class SpacjomatContext : ApplicationContext
             bool hadBackup = false;
             try
             {
-                isSimulatingInput = true;
                 Log(string.Format("InPlaceCorrection: Trigger (useAi={0}, selectAll={1}, autoSelect={2}).", useAi, selectAllFirst, autoSelectAllIfEmpty));
 
-                WaitForModifiersReleased(300);
+                WaitForModifiersReleased(180);
                 EnsureTargetForeground(capturedTargetHwnd);
 
                 try
@@ -2162,21 +2678,16 @@ public class SpacjomatContext : ApplicationContext
                 }
                 catch { }
 
-                for (int c = 0; c < 3; c++)
-                {
-                    try { Clipboard.Clear(); break; } catch { Thread.Sleep(15); }
-                }
-                Thread.Sleep(15);
-
                 bool effectivelySelectedAll = selectAllFirst;
                 if (selectAllFirst)
                 {
                     SimulateSelectAll();
-                    Thread.Sleep(40);
+                    Thread.Sleep(24);
                 }
 
+                uint seq0 = GetClipboardSequenceNumber();
                 SimulateCopy();
-                string originalText = PollClipboardText(selectAllFirst ? 40 : 26, 15);
+                string originalText = PollClipboardAfterCopy(seq0, selectAllFirst ? 280 : 120);
 
                 if (string.IsNullOrEmpty(originalText))
                 {
@@ -2184,16 +2695,18 @@ public class SpacjomatContext : ApplicationContext
                     {
                         effectivelySelectedAll = true;
                         SimulateSelectAll();
-                        Thread.Sleep(40);
+                        Thread.Sleep(24);
+                        uint seq1 = GetClipboardSequenceNumber();
                         SimulateCopy();
-                        originalText = PollClipboardText(36, 15);
+                        originalText = PollClipboardAfterCopy(seq1, 280);
                     }
                     else
                     {
-                        Thread.Sleep(30);
-                        if (selectAllFirst) { SimulateSelectAll(); Thread.Sleep(40); }
+                        Thread.Sleep(20);
+                        if (selectAllFirst) { SimulateSelectAll(); Thread.Sleep(28); }
+                        uint seq2 = GetClipboardSequenceNumber();
                         SimulateCopy();
-                        originalText = PollClipboardText(30, 18);
+                        originalText = PollClipboardAfterCopy(seq2, 320);
                     }
                 }
 
@@ -2237,6 +2750,7 @@ public class SpacjomatContext : ApplicationContext
                             if (sug.Options.Count > 0)
                             {
                                 Log(string.Format("InPlaceCorrection: AI suggest success ({0} options) in {1} ms.", sug.Options.Count, aiMs));
+                                LearnSafeTyposFromAiAsync(originalText, sug.Options[0].Text);
                                 suggestionPopup.ShowSuggestions(originalText, sug, aiMs, capturedTargetHwnd, effectivelySelectedAll);
                                 return;
                             }
@@ -2263,7 +2777,8 @@ public class SpacjomatContext : ApplicationContext
                                 if (floatingBanner != null) floatingBanner.ShowMessage(string.Format("🧠 AI ({0} ms): Tekst jest już w 100% poprawny!", aiMs));
                                 return;
                             }
-                            PasteTextIntoTarget(aiAuto, IntPtr.Zero, false, hadBackup, backupText, string.Format("🧠 AI Poprawiono cały tekst ({0} ms)", aiMs));
+                            LearnSafeTyposFromAiAsync(originalText, aiAuto);
+                            PasteTextIntoTarget(aiAuto, IntPtr.Zero, false, hadBackup, backupText, string.Format("🧠 AI Poprawiono ({0} ms)", aiMs));
                             return;
                         }
                     }
@@ -2309,7 +2824,6 @@ public class SpacjomatContext : ApplicationContext
             }
             finally
             {
-                // Tylko aktualna korekta zwalnia blokade (zawieszona, wymuszona wczesniej, nie ma prawa jej zdjac).
                 if (Thread.VolatileRead(ref correctionGen) == myGen)
                 {
                     isSimulatingInput = false;
@@ -2333,7 +2847,9 @@ public class SpacjomatContext : ApplicationContext
             whitelist.Clear();
             dictionary.Clear();
             strippedDict.Clear();
-            wordsByLength.Clear();
+            wordsByLenAndChar.Clear();
+            topWordsByLength.Clear();
+            learnedRulesCount = 0;
 
             // 1. Binary 4.5M SJP valid word hashes (.bin 64-bit or compact .d48 <20MB)
             string sjpBinPath = Path.Combine(baseDir, "sjp_hashes.bin");
@@ -2377,26 +2893,29 @@ public class SpacjomatContext : ApplicationContext
                 sjpIs48Bit = false;
             }
 
-            // 2. Clean Direct Rules (reguly.txt — NEVER inflates fuzzy weights!)
-            string rulesPath = Path.Combine(baseDir, "reguly.txt");
-            if (File.Exists(rulesPath))
+            // 2. Clean Direct Rules (reguly.txt) + Self-learned AI rules (nauczone_reguly.txt)
+            Action<string, bool> loadRulesFile = (path, isLearned) =>
             {
-                foreach (var line in File.ReadAllLines(rulesPath, Encoding.UTF8))
+                if (!File.Exists(path)) return;
+                foreach (var line in File.ReadAllLines(path, Encoding.UTF8))
                 {
                     var trim = line.Trim();
                     if (string.IsNullOrEmpty(trim) || trim.StartsWith("#")) continue;
                     var eq = trim.IndexOf('=');
                     if (eq > 0)
                     {
-                        string from = trim.Substring(0, eq).Trim();
+                        string from = trim.Substring(0, eq).Trim().ToLower();
                         string to = trim.Substring(eq + 1).Trim();
                         if (!string.IsNullOrEmpty(from) && !string.IsNullOrEmpty(to))
                         {
                             directRules[from] = to;
+                            if (isLearned) learnedRulesCount++;
                         }
                     }
                 }
-            }
+            };
+            loadRulesFile(Path.Combine(baseDir, "reguly.txt"), false);
+            loadRulesFile(Path.Combine(baseDir, "nauczone_reguly.txt"), true);
             if (!directRules.ContainsKey("sie")) directRules["sie"] = "się";
             if (!directRules.ContainsKey("tyldo")) directRules["tyldo"] = "tylko";
 
@@ -2433,7 +2952,7 @@ public class SpacjomatContext : ApplicationContext
                 }
             }
 
-            // 5. Unified Tier-1 Frequency Dictionary (slowa_pl.txt)
+            // 5. Unified Tier-1 Frequency Dictionary (slowa_pl.txt) z indeksem (dlugosc, pierwszaLitera)
             string dictPath = Path.Combine(baseDir, "slowa_pl.txt");
             if (File.Exists(dictPath))
             {
@@ -2447,21 +2966,39 @@ public class SpacjomatContext : ApplicationContext
                         {
                             string word = line.Substring(0, space).Trim().ToLower();
                             int freq;
-                            if (int.TryParse(line.Substring(space + 1).Trim(), out freq))
+                            if (word.Length > 0 && int.TryParse(line.Substring(space + 1).Trim(), out freq))
                             {
                                 dictionary[word] = freq;
 
-                                // Only keep strong high-signal words in fuzzy search buckets
-                                if (freq >= 340)
+                                // Rozszerzony prog freq >= 200 (~175K slow!) dzieki szybkiemu indeksowaniu wg pierwszej litery
+                                if (freq >= 200)
                                 {
                                     int len = word.Length;
-                                    List<KeyValuePair<string, int>> listByLen;
-                                    if (!wordsByLength.TryGetValue(len, out listByLen))
+                                    char firstBase = StripChar(word[0]);
+                                    Dictionary<char, List<KeyValuePair<string, int>>> byChar;
+                                    if (!wordsByLenAndChar.TryGetValue(len, out byChar))
                                     {
-                                        listByLen = new List<KeyValuePair<string, int>>();
-                                        wordsByLength[len] = listByLen;
+                                        byChar = new Dictionary<char, List<KeyValuePair<string, int>>>();
+                                        wordsByLenAndChar[len] = byChar;
                                     }
-                                    listByLen.Add(new KeyValuePair<string, int>(word, freq));
+                                    List<KeyValuePair<string, int>> bucket;
+                                    if (!byChar.TryGetValue(firstBase, out bucket))
+                                    {
+                                        bucket = new List<KeyValuePair<string, int>>();
+                                        byChar[firstBase] = bucket;
+                                    }
+                                    bucket.Add(new KeyValuePair<string, int>(word, freq));
+
+                                    if (freq >= 580)
+                                    {
+                                        List<KeyValuePair<string, int>> topList;
+                                        if (!topWordsByLength.TryGetValue(len, out topList))
+                                        {
+                                            topList = new List<KeyValuePair<string, int>>();
+                                            topWordsByLength[len] = topList;
+                                        }
+                                        topList.Add(new KeyValuePair<string, int>(word, freq));
+                                    }
                                 }
 
                                 string stripped = StripDiacritics(word);
@@ -2478,18 +3015,87 @@ public class SpacjomatContext : ApplicationContext
                 }
             }
 
-            foreach (var kv in wordsByLength)
+            foreach (var lenKv in wordsByLenAndChar)
             {
-                kv.Value.Sort((a, b) => b.Value.CompareTo(a.Value));
+                foreach (var charKv in lenKv.Value)
+                {
+                    charKv.Value.Sort((a, b) => b.Value.CompareTo(a.Value));
+                }
+            }
+            foreach (var topKv in topWordsByLength)
+            {
+                topKv.Value.Sort((a, b) => b.Value.CompareTo(a.Value));
             }
 
-            Log(string.Format("Loaded {0} rules, {1} bigrams, {2} whitelist, {3} tier1 words, {4} SJP hashes.",
-                directRules.Count, bigramRules.Count, whitelist.Count, dictionary.Count, sjpHashes.Length));
+            Log(string.Format("Loaded {0} rules ({1} learned), {2} bigrams, {3} whitelist, {4} tier1 words, {5} SJP hashes.",
+                directRules.Count, learnedRulesCount, bigramRules.Count, whitelist.Count, dictionary.Count, sjpHashes.Length));
+
+            // Zwolnij tymczasowy 36MB bufor LOH po wczytaniu sjp_hashes
+            GC.Collect();
         }
         catch (Exception ex)
         {
             Log("LoadAllDictionaries error: " + ex.Message);
         }
+    }
+
+    private static readonly object learnLock = new object();
+
+    public static void LearnSafeTyposFromAiAsync(string originalText, string correctedText)
+    {
+        if (string.IsNullOrWhiteSpace(originalText) || string.IsNullOrWhiteSpace(correctedText)) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                var origMatches = Regex.Matches(originalText, @"\b[\p{L}]+\b");
+                var corrMatches = Regex.Matches(correctedText, @"\b[\p{L}]+\b");
+                if (origMatches.Count == 0 || origMatches.Count != corrMatches.Count) return;
+
+                var newPairs = new List<KeyValuePair<string, string>>();
+                for (int i = 0; i < origMatches.Count; i++)
+                {
+                    string o = origMatches[i].Value.ToLower();
+                    string c = corrMatches[i].Value.ToLower();
+                    if (o.Length < 4 || c.Length < 4 || o == c) continue;
+                    if (directRules.ContainsKey(o) || whitelist.Contains(o)) continue;
+                    if (IsValidPolishWord(o)) continue;
+                    if (!IsValidPolishWord(c)) continue;
+
+                    double dist = QwertyLevenshtein(o, c, 2.1);
+                    if (dist > 0 && dist <= 2.05)
+                    {
+                        newPairs.Add(new KeyValuePair<string, string>(o, c));
+                    }
+                }
+
+                if (newPairs.Count == 0) return;
+                lock (learnLock)
+                {
+                    string lp = Path.Combine(GetAppDir(), "nauczone_reguly.txt");
+                    bool existedBefore = File.Exists(lp);
+                    var toAppend = new List<string>();
+                    if (!existedBefore) toAppend.Add("# Słowa wyuczone automatycznie z korekt AI (F7)");
+                    int addedCount = 0;
+                    foreach (var kv in newPairs)
+                    {
+                        if (!directRules.ContainsKey(kv.Key))
+                        {
+                            directRules[kv.Key] = kv.Value;
+                            learnedRulesCount++;
+                            addedCount++;
+                            toAppend.Add(kv.Key + "=" + kv.Value);
+                        }
+                    }
+                    if (addedCount > 0)
+                    {
+                        File.AppendAllLines(lp, toAppend, new UTF8Encoding(false));
+                        Log("Auto-learned " + addedCount + " rule(s) from F7 AI.");
+                    }
+                }
+            }
+            catch { }
+        });
     }
 
     public static string StripDiacritics(string s)
@@ -2810,7 +3416,36 @@ public class SpacjomatContext : ApplicationContext
             }
         }
 
-        // 6. Glued words separator (e.g. bardzoszybko -> bardzo szybko)
+        // 5b. Clean suffix typo normalization (-cjia -> -cja, np. aplikacjia -> aplikacja)
+        if (lower.EndsWith("cjia") && lower.Length >= 6)
+        {
+            string cja = lower.Substring(0, lower.Length - 4) + "cja";
+            if (IsValidPolishWord(cja)) return MatchCasing(input, cja);
+        }
+
+        // 6. Glued words separator (np. bardzoszybko -> bardzo szybko, nielubie -> nie lubie, wsumie -> w sumie)
+        if (lower.Length >= 5)
+        {
+            string[] shortPrefixes = new string[] {
+                "nie","dla","bez","pod","nad","jak","czy","tak","juz","już","ale",
+                "na","po","za","do","od","we","ze","bo","to","co","by","ja","ty","my","wy","on","w","z","o","u"
+            };
+            foreach (string pref in shortPrefixes)
+            {
+                if (lower.Length > pref.Length + 2 && lower.StartsWith(pref, StringComparison.Ordinal))
+                {
+                    string p2 = lower.Substring(pref.Length);
+                    if (p2 == "lem" || p2 == "bym" || p2 == "bys" || p2 == "smy" || p2 == "scie" || p2 == "cie" || p2 == "kolwiek" || p2 == "indziej") continue;
+                    string c1 = directRules.ContainsKey(pref) ? directRules[pref] : pref;
+                    string c2 = ResolveGluedPart(p2, 460);
+                    if (c2 != null)
+                    {
+                        return MatchCasing(input, c1 + " " + c2);
+                    }
+                }
+            }
+        }
+
         if (lower.Length >= 8)
         {
             for (int splitIdx = 4; splitIdx <= lower.Length - 4; splitIdx++)
@@ -2820,14 +3455,10 @@ public class SpacjomatContext : ApplicationContext
 
                 if (p2 == "lem" || p2 == "bym" || p2 == "bys" || p2 == "smy" || p2 == "scie" || p2 == "cie") continue;
 
-                int f1 = 0, f2 = 0;
-                bool ok1 = (directRules.ContainsKey(p1) || (dictionary.TryGetValue(p1, out f1) && f1 >= 480));
-                bool ok2 = (directRules.ContainsKey(p2) || (dictionary.TryGetValue(p2, out f2) && f2 >= 480));
-
-                if (ok1 && ok2)
+                string c1 = ResolveGluedPart(p1, 480);
+                string c2 = ResolveGluedPart(p2, 480);
+                if (c1 != null && c2 != null)
                 {
-                    string c1 = directRules.ContainsKey(p1) ? directRules[p1] : p1;
-                    string c2 = directRules.ContainsKey(p2) ? directRules[p2] : p2;
                     return MatchCasing(input, c1 + " " + c2);
                 }
             }
@@ -2840,45 +3471,85 @@ public class SpacjomatContext : ApplicationContext
             return MatchCasing(input, phoneticFix);
         }
 
-        // 8. Controlled Fuzzy Typo Search (Strict quality thresholds, never guesses weird low-freq words!)
+        // 8. Szybkie indeksowane wyszukiwanie Fuzzy wg (dlugosc, pierwszaLitera)
         int inputLen = lower.Length;
         if (inputLen <= 3 || inputLen > 28) return null;
 
-        double maxAllowedDist = (inputLen <= 5 && !isAggressiveMode) ? 1.1 : (isAggressiveMode ? 2.0 : 1.4);
+        double maxAllowedDist = (inputLen <= 5 && !isAggressiveMode) ? 1.15 : (isAggressiveMode ? 2.0 : 1.45);
         string bestTypo = null;
         double bestScore = double.MinValue;
-        char firstChar = lower[0];
         char firstStripped = strippedUnknown[0];
 
+        var candidateChars = new List<char>(6);
+        candidateChars.Add(firstStripped);
+        if (firstStripped < 128)
+        {
+            for (char ch = 'a'; ch <= 'z'; ch++)
+            {
+                if (ch != firstStripped && isAdjacentKey[firstStripped, ch]) candidateChars.Add(ch);
+            }
+        }
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        int maxBudgetMs = isLiveTyping ? 25 : 100;
+        int maxBudgetMs = isLiveTyping ? 6 : 60;
+
+        Action<string, int> evalCandidate = (dictWord, freq) =>
+        {
+            double dist = QwertyLevenshtein(lower, dictWord, maxAllowedDist);
+            if (dist > 0 && dist <= maxAllowedDist)
+            {
+                bool confident = (dist <= 0.85 && freq >= 200) || (dist <= 1.15 && freq >= 270) || (freq >= 420);
+                if (!confident) return;
+                double score = freq - (dist * 520.0);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestTypo = dictWord;
+                }
+            }
+        };
 
         for (int l = Math.Max(3, inputLen - 1); l <= inputLen + 1; l++)
         {
-            List<KeyValuePair<string, int>> list;
-            if (wordsByLength.TryGetValue(l, out list))
+            Dictionary<char, List<KeyValuePair<string, int>>> byChar;
+            if (!wordsByLenAndChar.TryGetValue(l, out byChar)) continue;
+
+            foreach (char cc in candidateChars)
             {
+                List<KeyValuePair<string, int>> list;
+                if (!byChar.TryGetValue(cc, out list)) continue;
                 for (int i = 0; i < list.Count; i++)
                 {
-                    if ((i & 255) == 0 && sw.ElapsedMilliseconds > maxBudgetMs) break;
+                    if ((i & 127) == 0 && sw.ElapsedMilliseconds > maxBudgetMs) break;
+                    evalCandidate(list[i].Key, list[i].Value);
+                }
+                if (sw.ElapsedMilliseconds > maxBudgetMs) break;
+            }
+            if (sw.ElapsedMilliseconds > maxBudgetMs) break;
+        }
 
-                    string dictWord = list[i].Key;
-                    char dwFirst = dictWord[0];
-                    if (dwFirst != firstChar && dwFirst != firstStripped && !(dwFirst < 128 && firstChar < 128 && isAdjacentKey[firstChar, dwFirst])) continue;
-
-                    double dist = QwertyLevenshtein(lower, dictWord, maxAllowedDist);
-                    if (dist > 0 && dist <= maxAllowedDist)
+        // Sprawdz pominiecie pierwszej litery/polskiego znaku (np. wietnie -> swietnie, rzestaje -> przestaje) wsrod czestych slow
+        if (sw.ElapsedMilliseconds <= maxBudgetMs && inputLen >= 5)
+        {
+            List<KeyValuePair<string, int>> longerTop;
+            if (topWordsByLength.TryGetValue(inputLen + 1, out longerTop))
+            {
+                int lim = Math.Min(longerTop.Count, 450);
+                for (int i = 0; i < lim; i++)
+                {
+                    string dw = longerTop[i].Key;
+                    if (StripChar(dw[1]) != firstStripped) continue;
+                    double dist = QwertyLevenshtein(lower, dw, 1.05);
+                    if (dist > 0 && dist <= 1.05)
                     {
-                        double penalty = dist * 180.0;
-                        double score = list[i].Value - penalty;
-                        if (score > bestScore && score > 340.0)
+                        double sc = longerTop[i].Value - (dist * 450.0);
+                        if (sc > bestScore)
                         {
-                            bestScore = score;
-                            bestTypo = dictWord;
+                            bestScore = sc;
+                            bestTypo = dw;
                         }
                     }
                 }
-                if (sw.ElapsedMilliseconds > maxBudgetMs) break;
             }
         }
 
@@ -2887,6 +3558,33 @@ public class SpacjomatContext : ApplicationContext
             return MatchCasing(input, bestTypo);
         }
 
+        return null;
+    }
+
+    private static string ResolveGluedPart(string part, int minFreq)
+    {
+        string rm;
+        if (directRules.TryGetValue(part, out rm) && rm.IndexOf(' ') < 0) return rm;
+        int f = 0;
+        if (dictionary.TryGetValue(part, out f) && f >= minFreq) return part;
+
+        string st = StripDiacritics(part);
+        List<string> cands;
+        if (strippedDict.TryGetValue(st, out cands))
+        {
+            string best = null;
+            int bestF = 0;
+            foreach (string c in cands)
+            {
+                int cf = 0;
+                if (dictionary.TryGetValue(c, out cf) && cf >= minFreq && cf > bestF)
+                {
+                    bestF = cf;
+                    best = c;
+                }
+            }
+            if (best != null) return best;
+        }
         return null;
     }
 
@@ -2942,6 +3640,29 @@ public class SpacjomatContext : ApplicationContext
                     tokens.RemoveAt(i + 1);
                     wordsFixed++;
                     i--;
+                    continue;
+                }
+
+                // Przesunieta spacja (np. "n astale" -> "na stale", "ni ewiem" -> "nie wiem")
+                string tLeft = tokens[i].ToLower();
+                string tRight = tokens[i + 2].ToLower();
+                if (tLeft.Length >= 1 && tLeft.Length <= 2 && tRight.Length >= 4 &&
+                    !IsValidPolishWord(tRight) && !whitelist.Contains(tRight) && !directRules.ContainsKey(tRight))
+                {
+                    string newLeft = tLeft + tRight[0];
+                    string newRight = tRight.Substring(1);
+                    if (newLeft == "na" || newLeft == "nie" || newLeft == "do" || newLeft == "dla" || newLeft == "czy" ||
+                        newLeft == "po" || newLeft == "za" || newLeft == "od" || newLeft == "we" || newLeft == "ze" ||
+                        newLeft == "to" || newLeft == "co" || newLeft == "ma")
+                    {
+                        string validRight = ResolveGluedPart(newRight, 420);
+                        if (validRight != null)
+                        {
+                            tokens[i] = MatchCasing(tokens[i], newLeft);
+                            tokens[i + 2] = MatchCasing(tokens[i + 2], validRight);
+                            wordsFixed++;
+                        }
+                    }
                 }
             }
         }
@@ -3201,6 +3922,7 @@ public class SpacjomatContext : ApplicationContext
                 if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
                 {
                     if (vk == VK_K && suppressNextKUp) { suppressNextKUp = false; return (IntPtr)1; }
+                    if (vk == 0x4C && suppressNextLUp) { suppressNextLUp = false; return (IntPtr)1; }
                     if (vk == VK_F7 && suppressNextF7Up) { suppressNextF7Up = false; return (IntPtr)1; }
                     if (vk == VK_F8 && suppressNextF8Up) { suppressNextF8Up = false; return (IntPtr)1; }
                     if (vk == VK_F9 && suppressNextF9Up) { suppressNextF9Up = false; return (IntPtr)1; }
@@ -3212,23 +3934,29 @@ public class SpacjomatContext : ApplicationContext
                     if (vk == VK_F9)
                     {
                         suppressNextF9Up = true;
-                        if (Instance != null) Instance.ToggleState();
+                        ThreadPool.QueueUserWorkItem(_ => RunOnUi(() => { if (Instance != null) Instance.ToggleState(); }));
                         return (IntPtr)1;
                     }
 
                     if (vk == VK_F7)
                     {
                         suppressNextF7Up = true;
-                        Log("Hook caught F7 -> AI (whole field)");
-                        TriggerInPlaceCorrection(true, true, false);
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            Log("Hook caught F7 -> AI (whole field)");
+                            TriggerInPlaceCorrection(true, true, false);
+                        });
                         return (IntPtr)1;
                     }
 
                     if (vk == VK_F8)
                     {
                         suppressNextF8Up = true;
-                        Log("Hook caught F8 -> Fast Offline Database");
-                        TriggerInPlaceCorrection(false, false, true);
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            Log("Hook caught F8 -> Fast Offline Database");
+                            TriggerInPlaceCorrection(false, false, true);
+                        });
                         return (IntPtr)1;
                     }
 
@@ -3241,8 +3969,22 @@ public class SpacjomatContext : ApplicationContext
                     if (ctrl && (shift || leftAlt) && vk == VK_K)
                     {
                         suppressNextKUp = true;
-                        Log("Hook caught Ctrl+Shift/Alt+K -> Fast Offline Database");
-                        TriggerInPlaceCorrection(false, false, true);
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            Log("Hook caught Ctrl+Shift/Alt+K -> Fast Offline Database");
+                            TriggerInPlaceCorrection(false, false, true);
+                        });
+                        return (IntPtr)1;
+                    }
+
+                    if (ctrl && shift && vk == 0x4C)
+                    {
+                        suppressNextLUp = true;
+                        ThreadPool.QueueUserWorkItem(_ =>
+                        {
+                            Log("Hook caught Ctrl+Shift+L -> AI (whole field)");
+                            TriggerInPlaceCorrection(true, true, false);
+                        });
                         return (IntPtr)1;
                     }
 
@@ -3338,25 +4080,26 @@ public class SpacjomatContext : ApplicationContext
                         return CallNextHookEx(hookId, nCode, wParam, lParam);
                     }
 
-                    byte[] keyState = new byte[256];
-                    for (int i = 0; i < 256; i++)
-                    {
-                        short s = GetAsyncKeyState(i);
-                        keyState[i] = (byte)((s & 0x8000) != 0 ? 0x80 : 0);
-                    }
-                    if ((keyState[0xA0] & 0x80) != 0 || (keyState[0xA1] & 0x80) != 0) keyState[0x10] |= 0x80;
-                    if ((keyState[0xA2] & 0x80) != 0 || (keyState[0xA3] & 0x80) != 0) keyState[0x11] |= 0x80;
-                    if ((keyState[0xA4] & 0x80) != 0 || (keyState[0xA5] & 0x80) != 0) keyState[0x12] |= 0x80;
-                    if (rightAlt) { keyState[0x11] |= 0x80; keyState[0x12] |= 0x80; }
-                    if ((GetKeyState(0x14) & 1) != 0) keyState[0x14] = 1;
+                    Array.Clear(hookKeyState, 0, 256);
+                    if ((GetAsyncKeyState(0xA0) & 0x8000) != 0) hookKeyState[0xA0] = 0x80;
+                    if ((GetAsyncKeyState(0xA1) & 0x8000) != 0) hookKeyState[0xA1] = 0x80;
+                    if (shift || hookKeyState[0xA0] != 0 || hookKeyState[0xA1] != 0) hookKeyState[0x10] = 0x80;
+                    if ((GetAsyncKeyState(0xA2) & 0x8000) != 0) hookKeyState[0xA2] = 0x80;
+                    if ((GetAsyncKeyState(0xA3) & 0x8000) != 0) hookKeyState[0xA3] = 0x80;
+                    if (ctrl || hookKeyState[0xA2] != 0 || hookKeyState[0xA3] != 0) hookKeyState[0x11] = 0x80;
+                    if (leftAlt) hookKeyState[0xA4] = 0x80;
+                    if (rightAlt) hookKeyState[0xA5] = 0x80;
+                    if (leftAlt || rightAlt) hookKeyState[0x12] = 0x80;
+                    if (rightAlt) { hookKeyState[0x11] |= 0x80; hookKeyState[0x12] |= 0x80; }
+                    if ((GetKeyState(0x14) & 1) != 0) hookKeyState[0x14] = 1;
 
                     IntPtr hkl = (fgThread != 0) ? GetKeyboardLayout(fgThread) : IntPtr.Zero;
-                    StringBuilder charBuffer = new StringBuilder(10);
-                    int count = ToUnicodeEx((uint)vk, hookStruct.scanCode, keyState, charBuffer, charBuffer.Capacity, 4, hkl);
+                    hookCharBuffer.Clear();
+                    int count = ToUnicodeEx((uint)vk, hookStruct.scanCode, hookKeyState, hookCharBuffer, hookCharBuffer.Capacity, 4, hkl);
 
                     if (count > 0)
                     {
-                        string str = charBuffer.ToString(0, Math.Min(count, charBuffer.Length));
+                        string str = hookCharBuffer.ToString(0, Math.Min(count, hookCharBuffer.Length));
                         foreach (char c in str)
                         {
                             if (char.IsLetter(c))
@@ -3404,28 +4147,68 @@ public class SpacjomatContext : ApplicationContext
     }
 
     private static readonly object logLock = new object();
+    private static readonly Queue<string> logQueue = new Queue<string>();
+    private static readonly AutoResetEvent logSignal = new AutoResetEvent(false);
+    private static int logWorkerStarted = 0;
+    private static volatile bool stopLogWorker = false;
 
     public static void Log(string msg)
     {
         try
         {
+            string line = string.Format("[{0:HH:mm:ss}] {1}\r\n", DateTime.Now, msg);
             lock (logLock)
             {
-                string p = Path.Combine(GetAppDir(), "log.txt");
-                try
-                {
-                    // Rotacja: log nie moze rosnac w nieskonczonosc (max ~512 KB + poprzedni plik).
-                    FileInfo fi = new FileInfo(p);
-                    if (fi.Exists && fi.Length > 512 * 1024)
-                    {
-                        string old = Path.Combine(GetAppDir(), "log.old.txt");
-                        try { if (File.Exists(old)) File.Delete(old); } catch { }
-                        File.Move(p, old);
-                    }
-                }
-                catch { }
-                File.AppendAllText(p, string.Format("[{0:HH:mm:ss}] {1}\r\n", DateTime.Now, msg), Encoding.UTF8);
+                if (logQueue.Count < 1000) logQueue.Enqueue(line);
             }
+            if (Interlocked.CompareExchange(ref logWorkerStarted, 1, 0) == 0)
+            {
+                Thread t = new Thread(LogWorkerLoop);
+                t.IsBackground = true;
+                t.Priority = ThreadPriority.BelowNormal;
+                t.Start();
+            }
+            logSignal.Set();
+        }
+        catch { }
+    }
+
+    private static void LogWorkerLoop()
+    {
+        while (!stopLogWorker)
+        {
+            logSignal.WaitOne(350);
+            FlushLogQueue();
+        }
+        FlushLogQueue();
+    }
+
+    private static void FlushLogQueue()
+    {
+        string batchText = null;
+        lock (logLock)
+        {
+            if (logQueue.Count == 0) return;
+            StringBuilder sb = new StringBuilder();
+            while (logQueue.Count > 0) sb.Append(logQueue.Dequeue());
+            batchText = sb.ToString();
+        }
+        if (string.IsNullOrEmpty(batchText)) return;
+        try
+        {
+            string p = Path.Combine(GetAppDir(), "log.txt");
+            try
+            {
+                FileInfo fi = new FileInfo(p);
+                if (fi.Exists && fi.Length > 512 * 1024)
+                {
+                    string old = Path.Combine(GetAppDir(), "log.old.txt");
+                    try { if (File.Exists(old)) File.Delete(old); } catch { }
+                    File.Move(p, old);
+                }
+            }
+            catch { }
+            File.AppendAllText(p, batchText, Encoding.UTF8);
         }
         catch { }
     }
@@ -3438,6 +4221,9 @@ public class SpacjomatContext : ApplicationContext
             if (watchdogTimer != null) { watchdogTimer.Stop(); watchdogTimer.Dispose(); watchdogTimer = null; }
             if (delayedRehookTimer != null) { delayedRehookTimer.Stop(); delayedRehookTimer.Dispose(); delayedRehookTimer = null; }
             stopPingThread = true;
+            stopLogWorker = true;
+            try { logSignal.Set(); } catch { }
+            FlushLogQueue();
             if (hotReloadTimer != null)
             {
                 hotReloadTimer.Stop();
@@ -3475,7 +4261,7 @@ public class SpacjomatContext : ApplicationContext
     }
 
     [STAThread]
-    public static void Main()
+    public static int Main()
     {
         bool createdNew = true;
         Mutex mutex = null;
@@ -3486,7 +4272,15 @@ public class SpacjomatContext : ApplicationContext
             string mutexName = "Spacjomat_Live_v12_" + safeDesk;
             string pingName = "Spacjomat_Ping_v12_" + safeDesk;
 
-            mutex = new Mutex(true, mutexName, out createdNew);
+            try
+            {
+                mutex = new Mutex(true, mutexName, out createdNew);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                createdNew = false;
+            }
+
             if (!createdNew)
             {
                 bool pinged = false;
@@ -3504,16 +4298,19 @@ public class SpacjomatContext : ApplicationContext
                 {
                     MessageBox.Show("Spacjomat jest już włączony i czuwa w tle!\n\n• F7 lub Ctrl+Shift+L = TYLKO AI (całe pole)\n• F8 lub Ctrl+Shift+K = TYLKO szybka baza Offline (~2 ms)\n\nProblem ze skrótami? Kliknij ikonę Spacjomatu przy zegarku → 🩺 Diagnostyka.", "Spacjomat", MessageBoxButtons.OK, MessageBoxIcon.Information, MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
                 }
-                return;
+                return 99;
             }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new SpacjomatContext());
+            return IntentionalExit ? 99 : 1;
         }
         catch (Exception ex)
         {
             Log("Fatal Main error: " + ex.ToString());
+            FlushLogQueue();
+            return 1;
         }
         finally
         {
@@ -3561,11 +4358,16 @@ public class HotkeyWindow : NativeWindow, IDisposable
         SpacjomatContext.Log("Native Hotkeys: " + Summary());
     }
 
-    // Probuje zarejestrowac (ponownie) tylko te skroty, ktore sie jeszcze nie powiodly (np. zajete przez inny program).
-    public void EnsureRegistered()
+    // Probuje zarejestrowac ponownie skroty (z opcja twardego odswiezenia po wybudzeniu/odblokowaniu).
+    public void EnsureRegistered(bool forceReRegister = false)
     {
         foreach (HotkeyEntry en in entries)
         {
+            if (forceReRegister && en.Registered)
+            {
+                try { SpacjomatContext.UnregisterHotKey(this.Handle, en.Id); } catch { }
+                en.Registered = false;
+            }
             if (en.Registered) continue;
             en.Registered = SpacjomatContext.RegisterHotKey(this.Handle, en.Id, en.Mods, en.Vk);
         }
@@ -3680,9 +4482,7 @@ public class FloatingBanner : Form
             this.Location = new Point(wa.Left + Math.Max(0, (wa.Width - this.Width) / 2), wa.Top + 35);
         }
         catch { }
-        this.TopMost = true;
-        this.Show();
-        this.BringToFront();
+        SpacjomatContext.ShowTopmostNoActivate(this);
         hideTimer.Stop();
         hideTimer.Start();
     }
@@ -4403,8 +5203,7 @@ public class GrammarlySuggestionForm : Form
         int fy = Math.Max(wa.Top + 8, Math.Min(wa.Bottom - this.Height - 8, anchorPt.Y));
         this.Location = new Point(fx, fy);
 
-        this.Show();
-        this.BringToFront();
+        SpacjomatContext.ShowTopmostNoActivate(this);
         this.Invalidate();
     }
 }
@@ -4417,6 +5216,7 @@ public class AiSettingsForm : Form
     private SpacjomatContext context;
     private CheckBox chkEnableAi;
     private CheckBox chkShowPill;
+    private CheckBox chkFastHedge;
     private ComboBox cmbCorrectionMode;
     private ComboBox cmbProvider;
     private TextBox txtApiKey;
@@ -4489,12 +5289,23 @@ public class AiSettingsForm : Form
             Text = "Pokaż pływającą pigułkę Grammarly na ekranie",
             Left = 20,
             Top = y,
-            Width = 710,
+            Width = 340,
             Height = 25,
             AutoSize = false
         };
         chkShowPill.CheckedChanged += (s, e) => { if (!suppressUiEvents) PreviewPillNow(); };
         this.Controls.Add(chkShowPill);
+
+        chkFastHedge = new CheckBox
+        {
+            Text = "⚡ Tryb Turbo F7 (asekuracja przy zwisie >1.9 s)",
+            Left = 370,
+            Top = y,
+            Width = 360,
+            Height = 25,
+            AutoSize = false
+        };
+        this.Controls.Add(chkFastHedge);
         y += 32;
 
         this.Controls.Add(new Label { Text = "Tryb pracy F7 / F8:", Left = 20, Top = y + 3, Width = 175, Height = 24 });
@@ -4561,9 +5372,9 @@ public class AiSettingsForm : Form
         cmbModel = new ComboBox { Left = 200, Top = y, Width = 365, DropDownStyle = ComboBoxStyle.DropDown };
         cmbModel.Items.AddRange(new object[]
         {
+            "gemini-3.1-flash-lite",
             "gemini-3.5-flash-lite",
             "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite",
             "gemini-3.8-flash",
             "llama-3.3-70b-versatile",
             "gpt-4o-mini"
@@ -4911,6 +5722,7 @@ public class AiSettingsForm : Form
         {
             chkEnableAi.Checked = cur.EnableAi;
             chkShowPill.Checked = cur.ShowPill;
+            chkFastHedge.Checked = cur.FastHedgeMode;
             cmbCorrectionMode.SelectedIndex = (cur.CorrectionMode == "auto") ? 1 : 0;
 
             string epLow = (cur.CustomEndpoint ?? "").ToLowerInvariant();
@@ -4934,7 +5746,7 @@ public class AiSettingsForm : Form
             txtApiKey.Text = cur.ApiKey ?? "";
             txtEndpoint.Text = cur.CustomEndpoint ?? "";
 
-            string curModel = string.IsNullOrEmpty(cur.Model) ? "gemini-3.5-flash-lite" : cur.Model;
+            string curModel = string.IsNullOrEmpty(cur.Model) ? "gemini-3.1-flash-lite" : cur.Model;
             if (!cmbModel.Items.Contains(curModel)) cmbModel.Items.Insert(0, curModel);
             cmbModel.Text = curModel;
 
@@ -4965,7 +5777,7 @@ public class AiSettingsForm : Form
         if (idx == 0)
         {
             if (txtEndpoint.Text.Contains("groq.com") || txtEndpoint.Text.Contains("localhost")) txtEndpoint.Text = "";
-            if (!cmbModel.Text.StartsWith("gemini")) cmbModel.Text = "gemini-3.5-flash-lite";
+            if (!cmbModel.Text.StartsWith("gemini")) cmbModel.Text = "gemini-3.1-flash-lite";
         }
         else if (idx == 1)
         {
@@ -5083,6 +5895,7 @@ public class AiSettingsForm : Form
         var cfg = new AiConfig();
         cfg.EnableAi = chkEnableAi.Checked;
         cfg.ShowPill = chkShowPill.Checked;
+        cfg.FastHedgeMode = chkFastHedge.Checked;
         cfg.CorrectionMode = (cmbCorrectionMode.SelectedIndex == 1) ? "auto" : "suggest";
         cfg.Provider = (cmbProvider.SelectedIndex == 0) ? "gemini" : "openai";
         cfg.ApiKey = AiConfig.SanitizeKey(txtApiKey.Text);
@@ -5149,7 +5962,7 @@ public class AiSettingsForm : Form
         try
         {
             string err;
-            List<string> models = AiCorrectionEngine.DiscoverGeminiModels(key, out err);
+            List<string> models = AiCorrectionEngine.DiscoverGeminiModels(key, true, out err);
             if (models != null && models.Count > 0)
             {
                 string currentTyped = cmbModel.Text.Trim();
@@ -5195,7 +6008,7 @@ public class AiSettingsForm : Form
         btnTest.Enabled = false;
         this.Cursor = Cursors.WaitCursor;
         txtTestStatus.ForeColor = Color.FromArgb(37, 99, 235);
-        txtTestStatus.Text = "Wysyłam próbne zdanie do AI (" + (cfg.Model ?? "gemini-3.5-flash-lite") + ")...";
+        txtTestStatus.Text = "Wysyłam próbne zdanie do AI (" + (cfg.Model ?? "gemini-3.1-flash-lite") + ")...";
         Application.DoEvents();
 
         try
