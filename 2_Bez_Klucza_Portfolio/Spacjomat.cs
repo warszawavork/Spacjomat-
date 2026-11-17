@@ -383,6 +383,8 @@ public static class AiCorrectionEngine
 
     // Zapamietuje dla kazdego modelu dzialajacy tryb thinkingConfig ("budget0", "minimal", "none")
     private static readonly Dictionary<string, string> thinkingModeCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, DateTime> modelCooldownUntil = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, double> modelAvgMs = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
     private static readonly object metaLock = new object();
     private static List<string> cachedGeminiModels = null;
     private static string cachedGeminiKey = "";
@@ -582,19 +584,67 @@ public static class AiCorrectionEngine
         return found;
     }
 
+    private static void RecordModelHealth(string model, bool ok, int httpCode, long ms)
+    {
+        if (string.IsNullOrEmpty(model)) return;
+        lock (metaLock)
+        {
+            if (ok)
+            {
+                modelCooldownUntil.Remove(model);
+                double prev;
+                modelAvgMs[model] = modelAvgMs.TryGetValue(model, out prev) ? (prev * 0.6 + ms * 0.4) : ms;
+            }
+            else if (httpCode == 503 || httpCode == 429 || httpCode == 0)
+            {
+                modelCooldownUntil[model] = DateTime.UtcNow.AddMinutes(3);
+            }
+            else if (httpCode == 404)
+            {
+                modelCooldownUntil[model] = DateTime.UtcNow.AddHours(6);
+            }
+        }
+    }
+
+    private static bool IsModelOnCooldown(string model)
+    {
+        if (string.IsNullOrEmpty(model)) return false;
+        lock (metaLock)
+        {
+            DateTime until;
+            if (modelCooldownUntil.TryGetValue(model, out until))
+            {
+                if (DateTime.UtcNow < until) return true;
+                modelCooldownUntil.Remove(model);
+            }
+        }
+        return false;
+    }
+
+    private static double GetModelAvgMs(string model)
+    {
+        if (string.IsNullOrEmpty(model)) return 0;
+        lock (metaLock)
+        {
+            double ms;
+            return modelAvgMs.TryGetValue(model, out ms) ? ms : 0;
+        }
+    }
+
     private static int ScoreGeminiModel(string name)
     {
         string l = name.ToLower();
         int score = 0;
         if (l.Contains("flash")) score += 500;
         if (l.Contains("lite")) score += 320;
-        if (l.Contains("3.1-flash-lite") && !l.Contains("preview")) score += 160;
+        if (l.Contains("3.1-flash-lite") && !l.Contains("preview")) score += 175;
+        if (l.Contains("flash-lite-latest")) score += 155;
         if (l.Contains("3.5-flash-lite")) score += 135;
-        if (l.Contains("flash-lite-latest")) score += 120;
-        if (l.Contains("3.1")) score += 95;
+        if (l.Contains("3.5")) score += 95;
+        if (l.Contains("3.1")) score += 85;
         if (l.Contains("3.")) score += 70;
-        if (l.Contains("2.5")) score += 30;
-        if (l.Contains("2.0")) score += 20;
+        if (l.Contains("2.5")) score -= 80;
+        if (l.Contains("2.0")) score -= 120;
         if (l.Contains("latest") && !l.Contains("lite")) score -= 140;
         if (l.Contains("pro") || l.Contains("deep-research")) score -= 200;
         if (l.Contains("exp") || l.Contains("thinking") || l.Contains("preview") || l.Contains("image") || l.Contains("nano") || l.Contains("lyria") || l.Contains("transcribe") || l.Contains("computer-use")) score -= 300;
@@ -858,19 +908,26 @@ public static class AiCorrectionEngine
             ser.MaxJsonLength = 10485760;
 
             string resultText = null;
-            int timeoutMs = (inputText != null && inputText.Length > 650) ? 10500 : 6500;
+            int timeoutMs = (inputText != null && inputText.Length > 650) ? 9000 : 4800;
 
             if (cfg.Provider == "gemini")
             {
                 string primaryModel = string.IsNullOrEmpty(cfg.Model) ? "gemini-3.1-flash-lite" : cfg.Model.Trim();
+                // Jesli glowny model mial niedawno 503/429 lub jest wyraźnie wolniejszy niz zapas, od razu uzyj zdrowego zapasu
+                string hedgeBackup = PickFastHedgeModel(primaryModel);
+                if (IsModelOnCooldown(primaryModel) && !string.IsNullOrEmpty(hedgeBackup))
+                {
+                    string tmp = primaryModel;
+                    primaryModel = hedgeBackup;
+                    hedgeBackup = tmp;
+                }
                 usedModel = primaryModel;
                 int errCode = 0;
 
-                // Szybka asekuracja równoległa: jeśli główny model nie odpowie w ~1.85s, odpalamy równoległy szybki zapas.
-                string hedgeBackup = PickFastHedgeModel(primaryModel);
-                if (cfg.FastHedgeMode && !string.IsNullOrEmpty(hedgeBackup))
+                if (cfg.FastHedgeMode && !string.IsNullOrEmpty(hedgeBackup) && !IsModelOnCooldown(hedgeBackup))
                 {
-                    int hedgeDelayMs = (inputText != null && inputText.Length > 350) ? 1750 : 1050;
+                    double avg = GetModelAvgMs(primaryModel);
+                    int hedgeDelayMs = (inputText != null && inputText.Length > 350) ? 1700 : ((avg > 1800) ? 800 : 1100);
                     resultText = ExecuteGeminiHedged(primaryModel, hedgeBackup, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, hedgeDelayMs, out usedModel, out errorMsg, out errCode);
                 }
                 else
@@ -878,23 +935,22 @@ public static class AiCorrectionEngine
                     resultText = CallGeminiSmart(primaryModel, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, null, out errorMsg, out errCode);
                 }
 
-                // Fallback na liste odkrytych modeli przy twardych bledach/limicie
+                // Maksymalnie 1 szybki fallback (max 3.8s), zeby F7 nigdy nie wisialo przez 20s
                 bool isInvalidKey = (errorMsg != null && (errorMsg.IndexOf("API key", StringComparison.OrdinalIgnoreCase) >= 0 || errorMsg.IndexOf("API_KEY", StringComparison.OrdinalIgnoreCase) >= 0));
                 if (string.IsNullOrEmpty(resultText) && !isInvalidKey &&
                     (errCode == 0 || errCode == 404 || errCode == 429 || errCode == 503 || errCode == 400))
                 {
                     string discErr;
                     var models = DiscoverGeminiModels(cleanKey, false, out discErr);
-                    int tries = 0;
                     foreach (string alt in models)
                     {
                         if (alt.Equals(primaryModel, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (tries >= 3) break;
-                        tries++;
+                        if (alt.Equals(hedgeBackup, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (IsModelOnCooldown(alt)) continue;
 
                         string altErr;
                         int altCode;
-                        string altRes = CallGeminiSmart(alt, cleanKey, sysPrompt, inputText, jsonMode, timeoutMs, null, out altErr, out altCode);
+                        string altRes = CallGeminiSmart(alt, cleanKey, sysPrompt, inputText, jsonMode, 3800, null, out altErr, out altCode);
                         if (!string.IsNullOrEmpty(altRes))
                         {
                             resultText = altRes;
@@ -909,6 +965,7 @@ public static class AiCorrectionEngine
                             SpacjomatContext.Log("AI auto-switched to working Gemini model: " + alt);
                             break;
                         }
+                        break; // Max 1 sequential fallback to keep latency bounded
                     }
                 }
             }
@@ -1004,7 +1061,11 @@ public static class AiCorrectionEngine
     private static string PickFastHedgeModel(string primaryModel)
     {
         string p = (primaryModel ?? "").ToLowerInvariant();
-        string[] pool = new string[] { "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest" };
+        string[] pool = new string[] { "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash-lite" };
+        foreach (string cand in pool)
+        {
+            if (!cand.Equals(p, StringComparison.OrdinalIgnoreCase) && !IsModelOnCooldown(cand)) return cand;
+        }
         foreach (string cand in pool)
         {
             if (!cand.Equals(p, StringComparison.OrdinalIgnoreCase)) return cand;
@@ -1141,6 +1202,7 @@ public static class AiCorrectionEngine
     {
         errorMsg = null;
         httpCode = 0;
+        var swCall = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var ser = new JavaScriptSerializer();
@@ -1211,6 +1273,8 @@ public static class AiCorrectionEngine
                                 var p0 = partsList[0] as Dictionary<string, object>;
                                 if (p0 != null && p0.ContainsKey("text"))
                                 {
+                                    swCall.Stop();
+                                    RecordModelHealth(model, true, 200, swCall.ElapsedMilliseconds);
                                     AiUsageTracker.RecordResponse("gemini", model, true, 200, pTok, cTok, tTok, respHeaders, null);
                                     return (string)p0["text"];
                                 }
@@ -1230,6 +1294,7 @@ public static class AiCorrectionEngine
                 return null;
             }
             errorMsg = ParseHttpError(wex, out httpCode);
+            RecordModelHealth(model, false, httpCode, swCall.ElapsedMilliseconds);
             WebHeaderCollection errHdrs = (wex.Response != null) ? wex.Response.Headers : null;
             AiUsageTracker.RecordResponse("gemini", model, false, httpCode, 0, 0, 0, errHdrs, errorMsg);
         }
@@ -2793,7 +2858,14 @@ public class SpacjomatContext : ApplicationContext
                         }
                     }
 
-                    Log("InPlaceCorrection: AI failed (" + (aiErr ?? "nieznany") + ")");
+                    Log("InPlaceCorrection: AI failed (" + (aiErr ?? "nieznany") + ") -> offline rescue");
+                    int wf = 0, ca = 0, sc = 0;
+                    string rescueText = CorrectFullTextStructure(originalText, out wf, out ca, out sc);
+                    if (!string.IsNullOrEmpty(rescueText) && !rescueText.Equals(originalText, StringComparison.Ordinal))
+                    {
+                        PasteTextIntoTarget(rescueText, IntPtr.Zero, false, hadBackup, backupText, "⚡ AI przeciążone — poprawiono bazą Offline!");
+                        return;
+                    }
                     RestoreClipboardSafe(hadBackup, backupText);
                     if (floatingBanner != null)
                     {
