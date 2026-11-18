@@ -5415,6 +5415,19 @@ public class AiSettingsForm : Form
 
         this.Controls.Add(new Label { Text = "Klucz API:", Left = 20, Top = y + 3, Width = 175, Height = 24 });
         txtApiKey = new TextBox { Left = 200, Top = y, Width = 476, UseSystemPasswordChar = true };
+        txtApiKey.TextChanged += (s, e) =>
+        {
+            if (suppressUiEvents) return;
+            string k = AiConfig.SanitizeKey(txtApiKey.Text);
+            if (k.StartsWith("gsk_", StringComparison.Ordinal) && cmbProvider.SelectedIndex != 1)
+            {
+                cmbProvider.SelectedIndex = 1; // Auto-switch to Groq
+            }
+            else if (k.StartsWith("AIza", StringComparison.Ordinal) && cmbProvider.SelectedIndex != 0)
+            {
+                cmbProvider.SelectedIndex = 0; // Auto-switch to Gemini
+            }
+        };
         this.Controls.Add(txtApiKey);
 
         btnToggleKey = new Button
@@ -5458,6 +5471,9 @@ public class AiSettingsForm : Form
             "gemini-3.5-flash-lite",
             "gemini-flash-lite-latest",
             "gemini-3.8-flash",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
             "llama-3.3-70b-versatile",
             "gpt-4o-mini"
         });
