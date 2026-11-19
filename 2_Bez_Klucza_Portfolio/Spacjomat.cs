@@ -469,20 +469,20 @@ public static class AiCorrectionEngine
 
         if (!jsonSuggestMode)
         {
-            return "Szybki korektor PL. " + styleNote +
-                   " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. Zachowaj URL i liczby. Zwróć WYŁĄCZNIE poprawiony tekst.";
+            return "Szybki korektor PL/EN. Wykryj język tekstu (polski lub angielski) i popraw w tym samym języku (nie tłumacz). " + styleNote +
+                   " Popraw literówki, znaki diakrytyczne, błędne słowa, gramatykę i interpunkcję w CAŁYM tekście bez skracania. Zachowaj URL i liczby. Zwróć WYŁĄCZNIE poprawiony tekst.";
         }
 
         if (style == "strict" || inputLen > 350)
         {
-            return "Szybki korektor PL. " + styleNote +
-                   " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
+            return "Szybki korektor PL/EN. Wykryj język (polski lub angielski) i popraw w tym samym języku (nie tłumacz). " + styleNote +
+                   " Popraw literówki, gramatykę, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
                    "Zwróć TYLKO czysty JSON: {\"hasErrors\":true,\"f\":[\"błąd->poprawka\"],\"o\":[{\"l\":\"✨ Poprawnie\",\"t\":\"cały poprawiony tekst\"}]}. " +
                    "W f max 3 wyrazy, w o 1 opcja. Brak błędów: {\"hasErrors\":false,\"f\":[],\"o\":[]}.";
         }
 
-        return "Szybki korektor PL. " + styleNote +
-               " Popraw literówki, polskie znaki, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
+        return "Szybki korektor PL/EN. Wykryj język (polski lub angielski) i popraw w tym samym języku (nie tłumacz). " + styleNote +
+               " Popraw literówki, gramatykę, błędne słowa i interpunkcję w CAŁYM tekście bez skracania. " +
                "Zwróć TYLKO czysty JSON: {\"hasErrors\":true,\"f\":[\"błąd->poprawka\"],\"o\":[{\"l\":\"✨ Poprawnie\",\"t\":\"cały poprawiony tekst\"},{\"l\":\"💬 Krócej/inaczej\",\"t\":\"opcjonalny 2. wariant\"}]}. " +
                "W f max 3 wyrazy, w o max 2 opcje. Brak błędów: {\"hasErrors\":false,\"f\":[],\"o\":[]}.";
     }
